@@ -15,6 +15,7 @@ timm
 wandb
 pybelt
 pynput
+keyboard
 # Guide to finding compatibility between cuda (nvcc -V), pytorch and xformers: https://www.felixsanz.dev/articles/compatibility-between-pytorch-cuda-and-xformers-versions
 --index-url https://download.pytorch.org/whl/cu118
 torch==2.2.0
