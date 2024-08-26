@@ -9,6 +9,7 @@ root = file.parents[0]
 sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
 sys.path.append(str(root) + '/unidepth')
+sys.path.append(str(root) + '/midas')
 
 # Utility
 import time
@@ -31,7 +32,8 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from unidepthv2 import UniDepthEstimator
+from unidepth_estimator import UniDepthEstimator # metric
+from midas_estimator import MidasDepthEstimator # relative
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
@@ -153,11 +155,16 @@ class BraceletController(AutoAssign):
     def load_depth_estimator(self):
         
         print(f'\nLOADING DEPTH ESTIMATOR')
-
-        self.depth_estimator = UniDepthEstimator(
-            model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
-            device=self.device
-        )
+        if self.metric:
+            self.depth_estimator = UniDepthEstimator(
+                model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
+                device=self.device
+            )
+        else:
+            self.depth_estimator = MidasDepthEstimator(
+                model_type = self.weights_depth_estimator, # midas_v21_384, dpt_levit_224
+                device=self.device
+            )
 
         print(f'\nDEPTH ESTIMATOR LOADED SUCCESFULLY')
         

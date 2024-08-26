@@ -8,15 +8,6 @@ This script is using code from the following sources:
 
 # region Setup
 import sys
-from pathlib import Path
-
-# Use the project file packages instead of the conda packages, i.e. add to system path for import
-file = Path(__file__).resolve()
-root = file.parents[0]
-sys.path.append(str(root) + '/yolov5')
-sys.path.append(str(root) + '/strongsort')
-sys.path.append(str(root) + '/MiDaS')
-
 import controller
 # endregion
 
@@ -28,13 +19,17 @@ if __name__ == '__main__':
     
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
+
+    run_object_tracker = True
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
-    weights_depth_estimator = 'v2-vits14' # v2-vits14, v1-cnvnxtl
+
+    run_depth_estimator = True
+    metric = False
+    weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
+    
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
     mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
-    run_object_tracker = False
-    run_depth_estimator = True
 
     print(f'\nLOADING CAMERA AND BRACELET')
 
@@ -90,6 +85,7 @@ if __name__ == '__main__':
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
                         run_object_tracker=run_object_tracker,
                         run_depth_estimator=run_depth_estimator,
+                        metric=metric,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
                         tracker_max_age=10,
