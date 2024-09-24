@@ -20,8 +20,6 @@ sys.path.append(str(parent_dir) + '/yolov5')
 sys.path.append(str(parent_dir) + '/strongsort')
 sys.path.append(str(parent_dir) + '/MiDaS')
 
-os.chdir(parent_dir)
-
 # Navigation
 import controller
 
@@ -62,13 +60,13 @@ from MiDaS.run import create_side_by_side, process
 # Navigation
 from bracelet import navigate_hand, connect_belt
 
-class GraspingTaskController(controller.BraceletController):
+class MultipleObjectsTaskController(controller.BraceletController):
 
     def save_output_data(self):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-        df.to_csv(self.output_path + f"grasping_task_participant_{self.participant}.csv")
+        df.to_csv(self.output_path + f"multiple_objects_task_participant_{self.participant}.csv")
 
     def print_output_data(self):
 
@@ -423,7 +421,7 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = GraspingTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+        bracelet_controller = MultipleObjectsTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
                         depth_estimator=depth_estimator,

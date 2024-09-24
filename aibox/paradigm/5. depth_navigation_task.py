@@ -62,13 +62,13 @@ from MiDaS.run import create_side_by_side, process
 # Navigation
 from bracelet import navigate_hand, connect_belt
 
-class GraspingTaskController(controller.BraceletController):
+class DepthNavigationTaskController(controller.BraceletController):
 
     def save_output_data(self):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-        df.to_csv(self.output_path + f"grasping_task_participant_{self.participant}.csv")
+        df.to_csv(self.output_path + f"depth_navigation_task_participant_{self.participant}.csv")
 
     def print_output_data(self):
 
@@ -296,7 +296,7 @@ class GraspingTaskController(controller.BraceletController):
 
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities)
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
 
         # region visualization
             # Write results
@@ -320,9 +320,8 @@ class GraspingTaskController(controller.BraceletController):
             im0 = annotator.result()
             if self.view_img:
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                #side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
-                #cv2.imshow("AIBox & Depth", side_by_side)
-                cv2.imshow("AIBox", im0)
+                side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
+                cv2.imshow("AIBox & Depth", side_by_side)
 
                 pressed_key = cv2.waitKey(1)
 
@@ -375,12 +374,10 @@ if __name__ == '__main__':
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
     mock_navigate = False # Navigate without the bracelet using only print commands
     belt_controller = None
-    run_object_tracker = True
-    run_depth_estimator = False
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['cup', 'bottle', 'cup', 'apple']
+    target_objs = ['apple', 'bottle', 'cup', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -423,7 +420,7 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = GraspingTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+        bracelet_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
                         depth_estimator=depth_estimator,
@@ -455,8 +452,8 @@ if __name__ == '__main__':
                         dnn=False,  # use OpenCV DNN for ONNX inference
                         vid_stride=1,  # video frame-rate stride_obj
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
-                        run_object_tracker=run_object_tracker,
-                        run_depth_estimator=run_depth_estimator,
+                        run_object_tracker=True,
+                        run_depth_estimator=True,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
                         tracker_max_age=10,

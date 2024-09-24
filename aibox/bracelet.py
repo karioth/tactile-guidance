@@ -10,6 +10,13 @@ import threading
 import sys
 from pynput.keyboard import Key, Listener
 import numpy as np
+from queue import PriorityQueue
+import cv2
+
+# Depth navigation functions
+
+from resources.depth_navigation_functions import map_obstacles, astar, smooth_path, check_obstacles_between_points
+
 
 # endregion
 
@@ -91,11 +98,12 @@ def calibrate_intensity():
 
 def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
 
-    # calculate angle
+    # Calculate angle
     xc_hand, yc_hand = handBB[:2]
     xc_target, yc_target = targetBB[:2]
     angle_radians = np.arctan2(yc_hand - yc_target, xc_target - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
+    print(angle)
 
     # Initialize motor intensities
     right_intensity = 0
@@ -118,6 +126,10 @@ def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
     elif 270 <= angle < 360:
         bottom_intensity = (360 - angle) / 90 * max_bottom_intensity
         right_intensity = (angle - 270) / 90 * max_right_intensity
+
+    if type(depth_img) != None:
+        
+        return int(right_intensity), int(left_intensity), int(top_intensity), int(bottom_intensity), 50
 
     # front / back motor (depth), currently it is used for grasping signal until front motor is added
     # If there is an anything between hand and target that can be hit (depth smaller than depth of both target and image) - move backwards
@@ -246,25 +258,22 @@ def navigate_hand(
         vibration_intensities = {'bottom': 50,
                                 'top': 50,
                                 'left': 50,
-                                'right': 50}):
+                                'right': 50},
+        mode = "grasping"):
     """ Function that navigates the hand to the target object. Handles cases when either hand or target is not detected.
 
     Args:
     - belt_controller -- belt controller object
     - bboxes -- object detections in current frame
-    - prev_hand -- previous hand BB
-    - prev_target -- previous target BB
     - target_cls -- the target object ID
     - hand_clss -- list of hand IDs
-    - freezed_tbbw -- carry over freezed targetBB width
-    - freezed_tbbh -- carry over freezed targetBB height
+    - depth_img -- depth map of the currently processed frame
+    - vibration_intensities -- intensitites of vibrations for each separate bracelet motor (range: 0 - 100)#
+    - mode -- guiding algorithm selection, options: grasping, depth_navigation
     
     Returns:
-    - hand -- current hand BB (next prev_hand in next iteration)
-    - target -- current target BB (next prev_target in next iteration)
-    - freezed_tbbw
-    - freezed_tbbh
-    - grasped
+    - overlapping -- information whether hand and target BBs are overlapping
+    - frozen_target -- frozen target BB (updated up until occlusion of hand and target occurs)
     """
 
     #global max_intensity
@@ -293,8 +302,30 @@ def navigate_hand(
  
     if hand is not None and target is not None:
         # Get varying vibration intensities depending on angle from hand to target
-        right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
+
+        if mode == "grasping": # Standard grasping mode without use of depth signals
+            right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
+
+        elif mode == "depth_navigation": # Grasping utilizing depth information used in the A* algorithm for finding best trajectory
+            astar_stop_condition, smoothing_distance = 50, 10
+            obstacles_mask = map_obstacles(hand, target, depth_img)
+            obstacles_between_hand_and_target = check_obstacles_between_points(hand, target, obstacles_mask, 1)
+            #obstacles_between_hand_and_target = True
+
+            if not obstacles_between_hand_and_target:
+                print('No obstacles')
+                right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
+            
+            else:
+                print('Obstacles')
+                path = astar(hand, target, obstacles_mask, 1, astar_stop_condition)
+                #path = fast_pathfinding(hand, target, obstacles_mask, 1, astar_stop_condition)
+                print(path)
+                smoothed_path = smooth_path(path, smoothing_distance)
+                right_int, left_int, top_int, bot_int, depth_int = get_intensity(smoothed_path[0], smoothed_path[1], vibration_intensities, depth_img)
+
         print(f'Vibration intensitites. Right: {right_int}, Left: {left_int}, Top: {top_int}, Bottom: {bot_int}.')
+
         # Check whether the hand is overlapping the target and freeze targetBB size if necessary (to avoid BB shrinking on occlusion)
         overlapping, frozen_x, frozen_y, freezed_tbbw, freezed_tbbh, freezed = check_overlap(hand, target, frozen_x, frozen_y, freezed_tbbw, freezed_tbbh, freezed)
         frozen_target = target.copy()

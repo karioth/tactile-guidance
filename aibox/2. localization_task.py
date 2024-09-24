@@ -303,10 +303,8 @@ if __name__ == '__main__':
                 break
             elif continue_with_baseline == 'n':
                 sys.exit()
-        #print('No bracelet intensities for that participant. Run bracelet_calibration first.')
-        #sys.exit()
 
-    #assert len(participant_vibration_intensities) == 4, 'Participation intensities file is corrupted. Run bracelet_calibration again.'
+    assert len(participant_vibration_intensities) == 4, 'Participation intensities file is corrupted. Run bracelet_calibration again.'
 
     connection_check, belt_controller = connect_belt()
     if connection_check:
@@ -318,8 +316,6 @@ if __name__ == '__main__':
                 break
             elif continue_without_bracelet == 'n':
                 sys.exit()
-        #print('Error connecting bracelet. Aborting.')
-        #sys.exit()
 
     try:
         localization_task(categories, participant_vibration_intensities)
