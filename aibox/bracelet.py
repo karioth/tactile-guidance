@@ -15,7 +15,7 @@ import cv2
 
 # Depth navigation functions
 
-from resources.depth_navigation_functions import map_obstacles, astar, smooth_path, check_obstacles_between_points
+from resources.depth_navigation_functions import map_obstacles, astar, smooth_path, check_obstacles_between_points, find_obstacle_target_point
 
 
 # endregion
@@ -318,11 +318,13 @@ def navigate_hand(
             
             else:
                 print('Obstacles')
-                path = astar(hand, target, obstacles_mask, 1, astar_stop_condition)
+                obstacle_target = find_obstacle_target_point(hand, target, obstacles_mask)
+                #path = astar(hand, target, obstacles_mask, 1, astar_stop_condition)
                 #path = fast_pathfinding(hand, target, obstacles_mask, 1, astar_stop_condition)
-                print(path)
-                smoothed_path = smooth_path(path, smoothing_distance)
-                right_int, left_int, top_int, bot_int, depth_int = get_intensity(smoothed_path[0], smoothed_path[1], vibration_intensities, depth_img)
+                #print(path)
+                #smoothed_path = smooth_path(path, smoothing_distance)
+                #right_int, left_int, top_int, bot_int, depth_int = get_intensity(smoothed_path[0], smoothed_path[1], vibration_intensities, depth_img)
+                right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
 
         print(f'Vibration intensitites. Right: {right_int}, Left: {left_int}, Top: {top_int}, Bottom: {bot_int}.')
 

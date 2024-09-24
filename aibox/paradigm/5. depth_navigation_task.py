@@ -377,7 +377,7 @@ if __name__ == '__main__':
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['apple', 'bottle', 'cup', 'apple']
+    target_objs = ['potted plant', 'bottle', 'cup', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
