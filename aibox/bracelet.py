@@ -96,6 +96,18 @@ def calibrate_intensity():
     return 50
 
 
+def get_bb_bounds(BB):
+
+    BB_x, BB_y, BB_w, BB_h = BB[:4]
+
+    BB_right = BB_x + BB_w//2
+    BB_left = BB_x - BB_w//2
+    BB_top = BB_y - BB_h//2
+    BB_bottom = BB_y + BB_h//2
+
+    return BB_right, BB_left, BB_top, BB_bottom
+
+
 def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
 
     # Calculate angle
@@ -134,26 +146,36 @@ def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
     # front / back motor (depth), currently it is used for grasping signal until front motor is added
     # If there is an anything between hand and target that can be hit (depth smaller than depth of both target and image) - move backwards
 
-    roi_x_min, roi_x_max, roi_y_min, roi_y_max = int(min(xc_target, xc_hand)), int(max(xc_target, xc_hand)), int(min(yc_target, yc_hand)), int(max(yc_target, yc_hand))
+    hand_right, hand_left, hand_top, hand_bottom = get_bb_bounds(handBB)
+    target_right, target_left, target_top, target_bottom = get_bb_bounds(targetBB)
 
-    roi = depth_img[roi_y_min:roi_y_max, roi_x_min:roi_x_max]
-    try:
-        max_depth = np.max(roi)
-    except ValueError:
-        max_depth = -1
+    roi_x_min, roi_x_max, roi_y_min, roi_y_max = int(min(hand_right, target_right)), int(max(hand_left, target_left)), int(min(hand_top, target_top)), int(max(hand_bottom, target_bottom))
 
-    print(handBB[7])
-    print(targetBB[7])
-    print(max_depth)
+    #roi_x_min, roi_x_max, roi_y_min, roi_y_max = int(min(xc_target, xc_hand)), int(max(xc_target, xc_hand)), int(min(yc_target, yc_hand)), int(max(yc_target, yc_hand))
 
+    if depth_img is not None:
+        roi = depth_img[roi_y_min:roi_y_max, roi_x_min:roi_x_max]
+        try:
+            max_depth = np.max(roi)
+        except ValueError:
+            max_depth = -1
+
+        #print(handBB[7])
+        #print(targetBB[7])
+        #print(max_depth)
+
+        #print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
+        #print(depth_img.shape, roi.shape)
+        if yc_hand < 480 and xc_hand > 640:
+            print(depth_img[int(yc_hand), int(xc_hand)])
     print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
     print(depth_img.shape, roi.shape)
     if yc_hand < 480 and xc_hand < 640:
         print(depth_img[int(yc_hand), int(xc_hand)])
 
-    """xyxy = xywh2xyxy(np.array(roi))
-    label = "ROI"
-    annotator.box_label(xyxy, label)
+        """xyxy = xywh2xyxy(np.array(roi))
+        label = "ROI"
+        annotator.box_label(xyxy, label)
 
     # Display results
     im0 = annotator.result()
@@ -450,7 +472,7 @@ def navigate_hand(
         if timer >= 50:
             searching = True
             timer = 0
-        print('Target found.', searching, timer)
+        #print('Target found.', searching, timer)
         return overlapping, target
     
 

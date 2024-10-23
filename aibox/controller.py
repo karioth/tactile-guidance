@@ -1,23 +1,21 @@
 # region Setup
-
 # System
-import os
-import platform
 import sys
 from pathlib import Path
-import itertools
-import time
-import numpy as np
-import requests
-from playsound import playsound
-import threading
 
 # Use the project file packages instead of the conda packages, i.e. add to system path for import
 file = Path(__file__).resolve()
 root = file.parents[0]
 sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
-sys.path.append(str(root) + '/MiDaS')
+sys.path.append(str(root) + '/unidepth')
+sys.path.append(str(root) + '/midas')
+
+# Utility
+import time
+import numpy as np
+from playsound import playsound
+import threading
 
 # Image processing
 import cv2
@@ -34,12 +32,11 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from unidepth_estimator import UniDepthEstimator # metric
+from midas_estimator import MidasDepthEstimator # relative
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
-
 # endregion
 
 # region Helpers
@@ -54,61 +51,31 @@ def play_start():
     play_start_thread.start()
 
 
-def get_midas_weights(model_type):
-
-    path = f'./MiDaS/weights/{model_type}.pt'
-
-    # Download weights if not available
-    if not os.path.exists(path):
-        print("File does not exist. Downloading weights...")
-
-        # Get version from model type
-        if 'v21' in model_type:
-            version = 'v2_1'
-        elif model_type == 'dpt_large_384' or model_type == 'dpt_hybrid_384':
-            version = 'v3'
-        else:
-            print('Fallback to latest version V3.1 (May 2024).')
-            version = 'v3_1'
-        
-        # Create and download from URL
-        url = f'https://github.com/isl-org/MiDaS/releases/download/{version}/{model_type}.pt'
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(path, 'wb') as file:
-                file.write(response.content)
-            print("Weights downloaded successfully!")
-        else:
-            print("Failed to download weights file. Status code:", response.status_code)
-    else:
-        print("Weights already exists!")
-
-    weights = f'./MiDaS/weights/{model_type}.pt'
-
-    return weights
-
-
-def get_depth(image, transform, device, model, model_type, net_w, net_h, vis=False, sides=False, bbs=None):
+def bbs_to_depth(image, depth=None, bbs=None):
     """
-    Depth Estimation with MiDaS.
+    Calculate the mean depth for bounding boxes (BBs) in an image.
+
+    Parameters:
+    image (numpy.ndarray): The input image.
+    depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
+    bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
+                                    as a list of 8 values [x, y, w, h, ... , mean_depth]. Defaults to None.
+    Returns:
+    numpy.ndarray: An array of bounding boxes with updated mean depth values.
+                   If no bounding boxes are provided, returns None.
+    Notes:
+    - If a bounding box already has a mean depth value (indicated by the 8th value not being -1), 
+      it will be left unchanged.
+    - The mean depth is calculated for the region of interest (ROI) defined by the bounding box 
+      in the depth map.
+    - If no bounding boxes are provided, a message will be printed and None will be returned.
     """
-    if image.max() > 1:
-        img = np.flip(image, 2)  # in [0, 255] (flip required to get RGB)
-        img = img/255
-    img_resized = transform({"image": img})["image"]
-
-    depth = process(device, model, model_type, img_resized, (net_w, net_h),
-                            image.shape[1::-1], False, True) # webcam: (720,1280)
-
-    if vis:
-        original_image_bgr = np.flip(image, 2) if sides else None
-        content = create_side_by_side(original_image_bgr, depth, False)
-        cv2.imshow('MiDaS Depth Estimation', content/255)
 
     if bbs is not None:
         outputs = []
         for bb in bbs:
             if bb[7] == -1: # if already 8 values, depth has already been calculated (revived bb)
+                print("HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO")
                 x,y,w,h = [int(coord) for coord in bb[:4]]
                 x2 = x+(w//2)
                 y2 = y+(h//2)
@@ -120,8 +87,10 @@ def get_depth(image, transform, device, model, model_type, net_w, net_h, vis=Fal
                 outputs.append(bb)
             else:
                 outputs.append(bb)
-
-    return depth, np.array(outputs)
+        return np.array(outputs)
+    else:
+        print('There are no BBs to calculate the depth for.')
+        return None
 
 
 def close_app(controller):
@@ -194,14 +163,16 @@ class BraceletController(AutoAssign):
     def load_depth_estimator(self):
         
         print(f'\nLOADING DEPTH ESTIMATOR')
-
-        self.weights_DE = get_midas_weights(self.depth_estimator)
-        self.model, self.transform, self.net_w, self.net_h = load_model(self.device,
-                                                                        self.weights_DE,
-                                                                        self.depth_estimator,
-                                                                        optimize=False,
-                                                                        height=640,
-                                                                        square=False)
+        if self.metric:
+            self.depth_estimator = UniDepthEstimator(
+                model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
+                device=self.device
+            )
+        else:
+            self.depth_estimator = MidasDepthEstimator(
+                model_type = self.weights_depth_estimator, # midas_v21_384, dpt_levit_224
+                device=self.device
+            )
 
         print(f'\nDEPTH ESTIMATOR LOADED SUCCESFULLY')
         
@@ -232,6 +203,8 @@ class BraceletController(AutoAssign):
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
+
+            print(f'Frame {frame+1}')
 
             # Start timer for FPS measure
             start = time.perf_counter()
@@ -344,7 +317,7 @@ class BraceletController(AutoAssign):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
+                #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
                     print('High change between frames. Resetting predictions.')
                     outputs = []
@@ -353,7 +326,23 @@ class BraceletController(AutoAssign):
 
 
             # Depth estimation (automatically skips revived bbs)
-            depth_img, outputs = get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
+            if self.run_depth_estimator:
+                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
+                    depthmap, _ = self.depth_estimator.predict_depth(im0)
+                    outputs = bbs_to_depth(im0, depthmap, outputs)
+                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
+                else:
+
+                    # Update depth values from previous outputs
+                    if prev_outputs.size > 0:
+                        for output in outputs:
+                            match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            if match.size > 0:
+                                output[7] = match[0][7]
+                            else:
+                                output[7] = -1
+            else:
+                depthmap = None
 
             # Set current tracking information as previous info
             prev_outputs = np.array(outputs)
@@ -396,7 +385,7 @@ class BraceletController(AutoAssign):
                 self.target_entered = True
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, class_target_obj, self.class_hand_nav, depth_img)
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, class_target_obj, self.class_hand_nav, depthmap)
         
             # Exit the loop if hand and object aligned horizontally and vertically and grasp signal was sent
             if grasped:
@@ -415,7 +404,7 @@ class BraceletController(AutoAssign):
 
             # Target BB
             if curr_target is not None:
-                print(curr_target)
+                #print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:
@@ -427,9 +416,11 @@ class BraceletController(AutoAssign):
             if self.view_img:
                 #cv2.namedWindow("AIBox", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO) # for resizing
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                #cv2.imshow("AIBox", im0) # original image only
-                side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
-                cv2.imshow("AIBox & Depth", side_by_side)
+                if self.run_depth_estimator:
+                    side_by_side = self.depth_estimator.create_depthmap(im0, depthmap, False) # original image & depth side-by-side
+                    cv2.imshow("AIBox & Depthmap", side_by_side)
+                else:
+                    cv2.imshow("AIBox", im0) # original image only
                 #cv2.resizeWindow("AIBox", im0.shape[1]//2, im0.shape[0]//2) # for resizing
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -526,7 +517,8 @@ class BraceletController(AutoAssign):
         # Warmup models
         self.warmup_model(self.model_obj)
         self.warmup_model(self.model_hand)
-        self.warmup_model(self.tracker.model,'tracker')
+        if self.run_object_tracker:
+            self.warmup_model(self.tracker.model,'tracker')
 
         # Start experiment loop
         self.experiment_loop(save_dir, save_img, index_add, vid_path, vid_writer)
