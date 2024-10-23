@@ -53,21 +53,29 @@ def play_start():
 
 def bbs_to_depth(image, depth=None, bbs=None):
     """
-    Calculates the average depth from a depth map for a region of interest in an image.
+    Calculate the mean depth for bounding boxes (BBs) in an image.
 
-    inputs:
-    image -- 
-    depth --
-    bbs --
-
-    returns:
-    outputs -- numpy array containing the average depth for each bb in this frame.
+    Parameters:
+    image (numpy.ndarray): The input image.
+    depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
+    bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
+                                    as a list of 8 values [x, y, w, h, ... , mean_depth]. Defaults to None.
+    Returns:
+    numpy.ndarray: An array of bounding boxes with updated mean depth values.
+                   If no bounding boxes are provided, returns None.
+    Notes:
+    - If a bounding box already has a mean depth value (indicated by the 8th value not being -1), 
+      it will be left unchanged.
+    - The mean depth is calculated for the region of interest (ROI) defined by the bounding box 
+      in the depth map.
+    - If no bounding boxes are provided, a message will be printed and None will be returned.
     """
 
     if bbs is not None:
         outputs = []
         for bb in bbs:
             if bb[7] == -1: # if already 8 values, depth has already been calculated (revived bb)
+                print("HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO")
                 x,y,w,h = [int(coord) for coord in bb[:4]]
                 x2 = x+(w//2)
                 y2 = y+(h//2)
@@ -309,7 +317,7 @@ class BraceletController(AutoAssign):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
+                #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
                     print('High change between frames. Resetting predictions.')
                     outputs = []
@@ -319,8 +327,20 @@ class BraceletController(AutoAssign):
 
             # Depth estimation (automatically skips revived bbs)
             if self.run_depth_estimator:
-                depthmap, _ = self.depth_estimator.predict_depth(im0)
-                outputs = bbs_to_depth(im0, depthmap, outputs)
+                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
+                    depthmap, _ = self.depth_estimator.predict_depth(im0)
+                    outputs = bbs_to_depth(im0, depthmap, outputs)
+                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
+                else:
+
+                    # Update depth values from previous outputs
+                    if prev_outputs.size > 0:
+                        for output in outputs:
+                            match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            if match.size > 0:
+                                output[7] = match[0][7]
+                            else:
+                                output[7] = -1
             else:
                 depthmap = None
 
@@ -384,7 +404,7 @@ class BraceletController(AutoAssign):
 
             # Target BB
             if curr_target is not None:
-                print(curr_target)
+                #print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:

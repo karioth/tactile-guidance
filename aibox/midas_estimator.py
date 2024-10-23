@@ -93,7 +93,7 @@ class MidasDepthEstimator:
             #torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)
             model = torch.hub.load("isl-org/ZoeDepth", self.model_type, pretrained=True)
         else:
-            model, self.transform, self.net_w, self.net_h = load_model(self.device, f'MiDaS/weights/{self.model_type}.pt', self.model_type)
+            model, self.transform, self.net_w, self.net_h = load_model(self.device, f'midas/weights/{self.model_type}.pt', self.model_type)
         model.to(self.device)
         return model
     

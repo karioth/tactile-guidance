@@ -146,12 +146,12 @@ def get_intensity(handBB, targetBB, max_intensity, depth_img):
         except ValueError:
             max_depth = -1
 
-        print(handBB[7])
-        print(targetBB[7])
-        print(max_depth)
+        #print(handBB[7])
+        #print(targetBB[7])
+        #print(max_depth)
 
-        print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
-        print(depth_img.shape, roi.shape)
+        #print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
+        #print(depth_img.shape, roi.shape)
         if yc_hand < 480 and xc_hand > 640:
             print(depth_img[int(yc_hand), int(xc_hand)])
 
@@ -177,6 +177,8 @@ def get_intensity(handBB, targetBB, max_intensity, depth_img):
                     depth_intensity = min(int(10000/depth_distance), max_intensity) # d<=10 -> 100, d=1000 -> 10
                 elif depth_distance < 0: #move backwards
                     depth_intensity = max(int(10000/depth_distance), -max_intensity) # d<=10 -> -100, d=1000 -> -10
+                else: # depth_distance = -1 - -1
+                    depth_intensity = 0
                 depth_intensity = round(depth_intensity/5) * 5 # steps in 5, so users can feel the change (can be replaced by a calibration value later for personalization)
             else:
                 depth_intensity = 0 # placeholder
@@ -425,7 +427,7 @@ def navigate_hand(
         if timer >= 50:
             searching = True
             timer = 0
-        print('Target found.', searching, timer)
+        #print('Target found.', searching, timer)
         return overlapping, target
     
 

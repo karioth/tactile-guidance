@@ -24,7 +24,7 @@ if __name__ == '__main__':
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
     run_depth_estimator = True
-    metric = False
+    metric = True
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
     
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
