@@ -56,8 +56,8 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from midas.midas.model_loader import default_models, load_model
+from midas.run import create_side_by_side, process
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
@@ -245,13 +245,32 @@ class DepthNavigationTaskController(controller.BraceletController):
                 #cv2.waitKey(0)
 
             # Depth estimation (automatically skips revived bbs)
-            if not self.run_depth_estimator:
+            #if not self.run_depth_estimator:
 
-                depth_img = None
+            #    depth_img = None
 
-            else:
+            #else:
                 
-                depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
+            #    depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
+
+            # Depth estimation (automatically skips revived bbs)
+            if self.run_depth_estimator:
+                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
+                    depthmap, _ = self.depth_estimator.predict_depth(im0)
+                    outputs = controller.bbs_to_depth(im0, depthmap, outputs)
+                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
+                else:
+
+                    # Update depth values from previous outputs
+                    if prev_outputs.size > 0:
+                        for output in outputs:
+                            match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            if match.size > 0:
+                                output[7] = match[0][7]
+                            else:
+                                output[7] = -1
+            else:
+                depthmap = None
 
             # Set current tracking information as previous info
             prev_outputs = np.array(outputs)
@@ -296,7 +315,8 @@ class DepthNavigationTaskController(controller.BraceletController):
 
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
+            #grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depthmap, self.participant_vibration_intensities, 'depth_navigation')
 
         # region visualization
             # Write results
@@ -320,7 +340,7 @@ class DepthNavigationTaskController(controller.BraceletController):
             im0 = annotator.result()
             if self.view_img:
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
+                side_by_side = create_side_by_side(im0, depthmap, False) # original image & depth side-by-side
                 cv2.imshow("AIBox & Depth", side_by_side)
 
                 pressed_key = cv2.waitKey(1)
@@ -369,15 +389,18 @@ if __name__ == '__main__':
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
-    depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
+    #depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = False # Navigate without the bracelet using only print commands
+    mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
+
+    metric = False
+    weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['potted plant', 'bottle', 'cup', 'apple']
+    target_objs = ['cup', 'potted plant', 'bottle', 'cup', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -423,7 +446,7 @@ if __name__ == '__main__':
         bracelet_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
-                        depth_estimator=depth_estimator,
+                        weights_depth_estimator=weights_depth_estimator,
                         source=source,  # file/dir/URL/glob/screen/0(webcam) # ROOT
                         iou_thres=0.45,  # NMS IOU threshold
                         max_det=1000,  # maximum detections per image
@@ -462,7 +485,8 @@ if __name__ == '__main__':
                         output_data=[],
                         output_path=output_path,
                         participant=participant,
-                        participant_vibration_intensities=participant_vibration_intensities) # debugging
+                        participant_vibration_intensities=participant_vibration_intensities,
+                        metric=metric) # debugging
         
         bracelet_controller.run()
 

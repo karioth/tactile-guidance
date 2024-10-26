@@ -56,8 +56,8 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from midas.midas.model_loader import default_models, load_model
+from midas.run import create_side_by_side, process
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
@@ -373,7 +373,7 @@ if __name__ == '__main__':
     depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = False # Navigate without the bracelet using only print commands
+    mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
     run_object_tracker = True
     run_depth_estimator = False

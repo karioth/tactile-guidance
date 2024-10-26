@@ -54,8 +54,8 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from midas.midas.model_loader import default_models, load_model
+from midas.run import create_side_by_side, process
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
