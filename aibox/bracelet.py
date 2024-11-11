@@ -281,7 +281,7 @@ def navigate_hand(
                                 'top': 50,
                                 'left': 50,
                                 'right': 50},
-        mode = "grasping"):
+        metric = False):
     """ Function that navigates the hand to the target object. Handles cases when either hand or target is not detected.
 
     Args:
@@ -324,16 +324,15 @@ def navigate_hand(
  
     if hand is not None and target is not None:
         # Get varying vibration intensities depending on angle from hand to target
-
-        if mode == "grasping": # Standard grasping mode without use of depth signals
+        # Navigation without depth map
+        if depth_img is None:
             right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
 
-        elif mode == "depth_navigation": # Grasping utilizing depth information used in the A* algorithm for finding best trajectory
-            astar_stop_condition, smoothing_distance = 50, 10
-            obstacles_mask = map_obstacles(hand, target, depth_img)
+        # Navigation with depth map
+        else:
+            obstacles_mask = map_obstacles(hand, target, depth_img, metric)
             obstacles_between_hand_and_target = check_obstacles_between_points(hand, target, obstacles_mask, 1)
-            #obstacles_between_hand_and_target = True
-
+            
             if not obstacles_between_hand_and_target:
                 print('No obstacles')
                 right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
@@ -341,11 +340,6 @@ def navigate_hand(
             else:
                 print('Obstacles')
                 obstacle_target = find_obstacle_target_point(hand, target, obstacles_mask)
-                #path = astar(hand, target, obstacles_mask, 1, astar_stop_condition)
-                #path = fast_pathfinding(hand, target, obstacles_mask, 1, astar_stop_condition)
-                #print(path)
-                #smoothed_path = smooth_path(path, smoothing_distance)
-                #right_int, left_int, top_int, bot_int, depth_int = get_intensity(smoothed_path[0], smoothed_path[1], vibration_intensities, depth_img)
                 right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
 
         print(f'Vibration intensitites. Right: {right_int}, Left: {left_int}, Top: {top_int}, Bottom: {bot_int}.')

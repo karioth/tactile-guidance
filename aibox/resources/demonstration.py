@@ -62,13 +62,7 @@ from midas.run import create_side_by_side, process
 # Navigation
 from bracelet import navigate_hand, connect_belt
 
-class DepthNavigationTaskController(controller.BraceletController):
-
-    def save_output_data(self):
-
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-
-        df.to_csv(self.output_path + f"depth_navigation_task_participant_{self.participant}.csv")
+class DemonstrationController(controller.BraceletController):
 
     def print_output_data(self):
 
@@ -78,31 +72,27 @@ class DepthNavigationTaskController(controller.BraceletController):
 
     def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
 
+        trial_duration = 2
+        wait_duration = trial_duration + 2
+
         # end trial
-        if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
-            trial_end_time = time.time()
+        if not self.ready_for_next_trial:
             print(f'Trial time: {trial_end_time - trial_start_time}')
-            self.output_data.append(trial_end_time - trial_start_time)
-            self.output_data.append(chr(pressed_key))
-            
-            if pressed_key == ord('y'):
-                print("TRIAL SUCCESSFUL")
-            elif pressed_key == ord('n'):
-                print("TRIAL FAILED")
-            
-            if self.obj_index >= len(self.target_objs) - 1:
-                print("ALL TARGETS COVERED")
-                return "break"
-            else:
-                print("MOVING TO NEXT TARGET")
+            if trial_end_time - trial_start_time > trial_duration:
                 self.obj_index += 1
                 self.ready_for_next_trial = True
                 self.class_target_obj = -1
+
+            if self.obj_index >= len(self.target_objs) - 1:
+                print("ALL TARGETS COVERED")
+                return "break"
+
         # start next trial
-        elif pressed_key == ord('s') and self.ready_for_next_trial:
-            print("STARTING NEXT TRIAL")
-            self.target_entered = False
-            self.ready_for_next_trial = False
+        elif self.ready_for_next_trial:
+            if trial_end_time - trial_start_time > wait_duration:
+                print("STARTING NEXT TRIAL")
+                self.target_entered = False
+                self.ready_for_next_trial = False
         # end experiment
         elif pressed_key == ord('q'):
             return "break"
@@ -121,7 +111,7 @@ class DepthNavigationTaskController(controller.BraceletController):
         self.ready_for_next_trial = True
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
-        trial_start_time = -1 # placeholder initial value
+        trial_start_time = time.time() # placeholder initial value
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -245,32 +235,13 @@ class DepthNavigationTaskController(controller.BraceletController):
                 #cv2.waitKey(0)
 
             # Depth estimation (automatically skips revived bbs)
-            #if not self.run_depth_estimator:
+            if not self.run_depth_estimator:
 
-            #    depth_img = None
+                depth_img = None
 
-            #else:
-                
-            #    depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
-
-            # Depth estimation (automatically skips revived bbs)
-            if self.run_depth_estimator:
-                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
-                    depthmap, _ = self.depth_estimator.predict_depth(im0)
-                    outputs = controller.bbs_to_depth(im0, depthmap, outputs)
-                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
-                else:
-
-                    # Update depth values from previous outputs
-                    if prev_outputs.size > 0:
-                        for output in outputs:
-                            match = prev_outputs[prev_outputs[:, 4] == output[4]]
-                            if match.size > 0:
-                                output[7] = match[0][7]
-                            else:
-                                output[7] = -1
             else:
-                depthmap = None
+                
+                depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
 
             # Set current tracking information as previous info
             prev_outputs = np.array(outputs)
@@ -315,8 +286,7 @@ class DepthNavigationTaskController(controller.BraceletController):
 
 
             # Navigate the hand based on information from last frame and current frame detections
-            #grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depthmap, self.participant_vibration_intensities, self.metric)
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities)
 
         # region visualization
             # Write results
@@ -340,8 +310,9 @@ class DepthNavigationTaskController(controller.BraceletController):
             im0 = annotator.result()
             if self.view_img:
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                side_by_side = create_side_by_side(im0, depthmap, False) # original image & depth side-by-side
-                cv2.imshow("AIBox & Depth", side_by_side)
+                #side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
+                #cv2.imshow("AIBox & Depth", side_by_side)
+                cv2.imshow("AIBox", im0)
 
                 pressed_key = cv2.waitKey(1)
 
@@ -352,7 +323,6 @@ class DepthNavigationTaskController(controller.BraceletController):
                 if trial_info == "break":
                     try:
                         bracelet_controller.print_output_data()
-                        bracelet_controller.save_output_data()
                     except ValueError:
                         pass
                     break
@@ -389,18 +359,16 @@ if __name__ == '__main__':
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
-    #depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
+    depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
+    mock_navigate = False # Navigate without the bracelet using only print commands
     belt_controller = None
-
-    metric = True
-    weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
+    run_object_tracker = True
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['bottle', 'potted plant', 'bottle', 'cup', 'apple']
+    target_objs = ['cup', 'bottle', 'cup', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -443,10 +411,10 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+        bracelet_controller = DemonstrationController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
-                        weights_depth_estimator=weights_depth_estimator,
+                        depth_estimator=depth_estimator,
                         source=source,  # file/dir/URL/glob/screen/0(webcam) # ROOT
                         iou_thres=0.45,  # NMS IOU threshold
                         max_det=1000,  # maximum detections per image
@@ -457,7 +425,7 @@ if __name__ == '__main__':
                         conf_thres=0.7,  # confidence threshold
                         save_conf=False,  # save confidences in --save-txt labels
                         save_crop=False,  # save cropped prediction boxes
-                        nosave=True,  # do not save images/videos
+                        nosave=False,  # do not save images/videos
                         classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
                         class_hand_nav=[80,81],
@@ -475,8 +443,8 @@ if __name__ == '__main__':
                         dnn=False,  # use OpenCV DNN for ONNX inference
                         vid_stride=1,  # video frame-rate stride_obj
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
-                        run_object_tracker=True,
-                        run_depth_estimator=True,
+                        run_object_tracker=run_object_tracker,
+                        run_depth_estimator=False,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
                         tracker_max_age=10,
@@ -485,8 +453,7 @@ if __name__ == '__main__':
                         output_data=[],
                         output_path=output_path,
                         participant=participant,
-                        participant_vibration_intensities=participant_vibration_intensities,
-                        metric=metric) # debugging
+                        participant_vibration_intensities=participant_vibration_intensities) # debugging
         
         bracelet_controller.run()
 

@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from queue import PriorityQueue
 
-def map_obstacles(handBB, targetBB, depth_map):
+def map_obstacles(handBB, targetBB, depth_map, metric):
 
     bbs_dilation = 5
 
@@ -25,23 +25,26 @@ def map_obstacles(handBB, targetBB, depth_map):
 
     # Object closer to camera relative to hand -> values are larger
     hand_depth = handBB[7]
+
     #obstacle_mask = depth_map < hand_depth # binary mask
-    obstacle_mask = depth_map < hand_depth - 300
+    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map < hand_depth
     print(f'depth_map {depth_map.shape}, {depth_map.min()} - {depth_map.max()}')
     print(f'hand_depth {hand_depth.shape}, {hand_depth.min()} - {hand_depth.max()}')
     print(f'obstacle_mask {obstacle_mask.shape}, {obstacle_mask.min()} - {obstacle_mask.max()}')
 
     # Mask hand BB
-    obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = True
+    #obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = True
+    obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = False
 
     # Mask target BB
-    obstacle_mask[target_top-bbs_dilation:target_bottom+bbs_dilation, target_left-bbs_dilation:target_right+bbs_dilation] = True
+    #obstacle_mask[target_top-bbs_dilation:target_bottom+bbs_dilation, target_left-bbs_dilation:target_right+bbs_dilation] = True
+    obstacle_mask[target_top-bbs_dilation:target_bottom+bbs_dilation, target_left-bbs_dilation:target_right+bbs_dilation] = False
 
     # Dilate obstacles
     expanded_obstacle_mask = cv2.dilate(obstacle_mask.astype(np.uint8), np.ones((5, 5), np.uint8))
     #depth_map[expanded_obstacle_mask > 0] = hand_depth - 5
 
-    mask_rgb = cv2.cvtColor(obstacle_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+    mask_rgb = cv2.cvtColor(expanded_obstacle_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
     cv2.imshow("expanded_obstacle_mask", mask_rgb)
     pressed_key = cv2.waitKey(1)
 
@@ -290,17 +293,9 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     print(obstacle_map)
     print(obstacle_map.shape)
     print(type(obstacle_map))
-
-    roi_general = obstacle_map[:,int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
-
-    print(obstacle_map.shape)
-
-    #roi_rgb = cv2.cvtColor(roi_general.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    #cv2.imshow("ROI", roi_rgb)
-    #pressed_key = cv2.waitKey(1)
     
     # Determine general direction of movement
-    
+
     angle_radians = np.arctan2(yc_hand - yc_target, xc_target - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
 
@@ -313,6 +308,53 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
     roi_target_point = obstacle_map[:int(yc_hand),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
 
+    # Find corners of obstacles (candidates for a target point)
+
+    dst = cv2.cornerHarris(roi_target_point,2,3,0.04) 
+
+    print(f'dst: {dst}')
+
+    #result is dilated for marking the corners, not important
+    dst = cv2.dilate(dst,None)
+    cv2.imshow('dst',dst)
+
+    # Iterate through candidates
+    min_y, min_x, max_x = -1, -1, -1
+    for i in range(dst.shape[0]):
+        for j in range(dst.shape[1]):
+            if dst[i, j] == 1:
+                if min_y == -1:
+                    min_y = i
+                if min_x == -1:
+                    min_x = j
+                elif min_x > -1 and min_x > j:
+                    min_x = j
+                elif max_x < j:
+                    max_x = j
+
+    print(f'Min x: {min_x}, Min y: {min_y}, Max x: {max_x}')
+
+    if 90 < angle < 270: # target on the left
+        target_point = [min_x, min_y]
+    else: # target on the right
+        target_point = [max_x, min_y]
+
+    # find max x and min y point (most top-right or top-left corner)
+    max_x, max_y = np.unravel_index(np.argmax(dst), dst.shape)
+    min_y = np.argmin(dst[max_x])
+    print(f'Max x: {max_x}, Max y: {max_y}')
+    #corner = dst[np.argmax(dst[:,])[-1], np.argmax(dst[:])[0]]
+    #print(f'corner: {corner}')
+
+    # Threshold for an optimal value, it may vary depending on the image.
+    roi_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+    roi_rgb[target_point[0], target_point[1]]=[0,0,255]
+
+    cv2.imshow('dst',roi_rgb)
+
+    return [max_x, max_y]
+    
+    """
     min_values = np.min(roi_target_point, axis=1)
     min_indices = np.argmin(roi_target_point, axis=1)
 
@@ -364,5 +406,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     cv2.circle(roi_rgb, (obstacle_x, obstacle_y), radius=5, color=(0, 0, 255), thickness=-1)
     cv2.imshow("ROI", roi_rgb)
     pressed_key = cv2.waitKey(1)
+    
 
     return [obstacle_x + int(min(xc_hand, xc_target)), obstacle_y]
+    """
