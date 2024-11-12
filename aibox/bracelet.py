@@ -49,8 +49,6 @@ def choose_detection(bboxes, previous_bbox=None, w=1920, h=1080):
     exponential_weight = 2
     distance_weight = 100
 
-    #print(f'\nPrevious BB: {previous_bbox}')
-
     candidates = []
     for bbox in bboxes: # x, y, w, h, id, cls, conf
         # bbox has to be within image dimensions
@@ -74,9 +72,6 @@ def choose_detection(bboxes, previous_bbox=None, w=1920, h=1080):
 
             # total score
             score = track_id_score * confidence_score * distance_inverted
-            #print(f'Current BB: {bbox}')
-            #print(f'TrackID = {current_track_id}, confidence = {confidence}, distance = {distance}')
-            #print(f'Score {score} = {track_id_score} * {confidence_score} * {distance_inverted}\n')
 
             # Possible scores:
             # ꝏ -- same trackingID
@@ -115,7 +110,6 @@ def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
     xc_target, yc_target = targetBB[:2]
     angle_radians = np.arctan2(yc_hand - yc_target, xc_target - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
-    print(angle)
 
     # Initialize motor intensities
     right_intensity = 0
@@ -151,8 +145,6 @@ def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
 
     roi_x_min, roi_x_max, roi_y_min, roi_y_max = int(min(hand_right, target_right)), int(max(hand_left, target_left)), int(min(hand_top, target_top)), int(max(hand_bottom, target_bottom))
 
-    #roi_x_min, roi_x_max, roi_y_min, roi_y_max = int(min(xc_target, xc_hand)), int(max(xc_target, xc_hand)), int(min(yc_target, yc_hand)), int(max(yc_target, yc_hand))
-
     if depth_img is not None:
         roi = depth_img[roi_y_min:roi_y_max, roi_x_min:roi_x_max]
         try:
@@ -160,33 +152,9 @@ def get_intensity(handBB, targetBB, vibration_intensities, depth_img):
         except ValueError:
             max_depth = -1
 
-        #print(handBB[7])
-        #print(targetBB[7])
-        #print(max_depth)
-
-        #print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
-        #print(depth_img.shape, roi.shape)
-        if yc_hand < 480 and xc_hand > 640:
-            print(depth_img[int(yc_hand), int(xc_hand)])
-    print(f"{xc_hand},{yc_hand},{xc_target},{yc_target}")
-    print(depth_img.shape, roi.shape)
-    if yc_hand < 480 and xc_hand < 640:
-        print(depth_img[int(yc_hand), int(xc_hand)])
-
-        """xyxy = xywh2xyxy(np.array(roi))
-        label = "ROI"
-        annotator.box_label(xyxy, label)
-
-    # Display results
-    im0 = annotator.result()
-    cv2.imshow("ROI", im0) # original image only
-    """
-
     baseline_depth_intensity = max(vibration_intensities.values())
 
-    #if max_depth > handBB[7]:
     if max_depth < handBB[7]:
-        print("object in line of movement")
         depth_intensity = round(-baseline_depth_intensity/5) * 5
 
     # Otherwise check if hand is closer or further than the target and set depth intensity accordingly
@@ -241,7 +209,6 @@ def check_overlap(handBB, targetBB, frozen_x, frozen_y, freezed_width, freezed_h
     # If both BBs touch, keep freezed targetBB size
     if is_touched or is_inside:
         freezed = True
-        #print('Touched!')
         # only if the center of the is in the targetBB send the grasp signal
         if (target_left <= hand_x <= target_right) and (target_top <= hand_y <= target_bottom):
             return True, frozen_x, frozen_y, freezed_width, freezed_height, freezed
@@ -250,7 +217,6 @@ def check_overlap(handBB, targetBB, frozen_x, frozen_y, freezed_width, freezed_h
     # Else, update targetBB size
     else:
         freezed = False
-        #print('Updated BB size.')
         tbbw, tbbh = targetBB[2:4]
         return False, target_x, target_y, tbbw, tbbh, freezed
 
@@ -320,7 +286,6 @@ def navigate_hand(
     bboxes_objects = [detection for detection in bboxes if detection[5] == target_cls]
     target = choose_detection(bboxes_objects, prev_target)
     prev_target = target
-    print(target)
  
     if hand is not None and target is not None:
         # Get varying vibration intensities depending on angle from hand to target
@@ -334,15 +299,11 @@ def navigate_hand(
             obstacles_between_hand_and_target = check_obstacles_between_points(hand, target, obstacles_mask, 1)
             
             if not obstacles_between_hand_and_target:
-                print('No obstacles')
                 right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, target, vibration_intensities, depth_img)
             
             else:
-                print('Obstacles')
                 obstacle_target = find_obstacle_target_point(hand, target, obstacles_mask)
                 right_int, left_int, top_int, bot_int, depth_int = get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
-
-        print(f'Vibration intensitites. Right: {right_int}, Left: {left_int}, Top: {top_int}, Bottom: {bot_int}.')
 
         # Check whether the hand is overlapping the target and freeze targetBB size if necessary (to avoid BB shrinking on occlusion)
         overlapping, frozen_x, frozen_y, freezed_tbbw, freezed_tbbh, freezed = check_overlap(hand, target, frozen_x, frozen_y, freezed_tbbw, freezed_tbbh, freezed)
@@ -375,12 +336,6 @@ def navigate_hand(
     # 2. Guidance
     if hand is not None and target is not None:
         searching = True
-
-        print("depth intensity: " + str(depth_int))
-        if depth_int > 0:
-            print("move forward")
-        elif depth_int < 0:
-            print("move backwards")
 
         if belt_controller:
             """
@@ -474,5 +429,5 @@ def navigate_hand(
     else:
         timer = 0
         searching = True
-        print('Target not found yet.')
+        #print('Target not found yet.')
         return overlapping, None

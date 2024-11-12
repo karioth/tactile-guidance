@@ -75,14 +75,12 @@ def bbs_to_depth(image, depth=None, bbs=None):
         outputs = []
         for bb in bbs:
             if bb[7] == -1: # if already 8 values, depth has already been calculated (revived bb)
-                print("HELLOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO")
                 x,y,w,h = [int(coord) for coord in bb[:4]]
                 x2 = x+(w//2)
                 y2 = y+(h//2)
                 roi = depth[y:y2, x:x2]
                 mean_depth = np.mean(roi)
-                median_depth = np.median(roi)
-                #print(f'Mean depth: {mean_depth}, Median depth: {median_depth}')
+                #median_depth = np.median(roi)
                 bb[7] = mean_depth
                 outputs.append(bb)
             else:
@@ -317,9 +315,8 @@ class BraceletController(AutoAssign):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    print('High change between frames. Resetting predictions.')
+                    #print('High change between frames. Resetting predictions.')
                     outputs = []
                 #cv2.imshow('Diff',diff)
                 #cv2.waitKey(0)    
@@ -330,7 +327,6 @@ class BraceletController(AutoAssign):
                 if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
                     depthmap, _ = self.depth_estimator.predict_depth(im0)
                     outputs = bbs_to_depth(im0, depthmap, outputs)
-                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
                 else:
 
                     # Update depth values from previous outputs
@@ -385,7 +381,6 @@ class BraceletController(AutoAssign):
                 self.target_entered = True
 
             # Navigate the hand based on information from last frame and current frame detections
-            print(f'METRIC? {self.metric}')
             grasped, curr_target = navigate_hand(self.belt_controller, outputs, class_target_obj, self.class_hand_nav, depthmap, self.metric)
         
             # Exit the loop if hand and object aligned horizontally and vertically and grasp signal was sent
@@ -405,7 +400,6 @@ class BraceletController(AutoAssign):
 
             # Target BB
             if curr_target is not None:
-                #print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:

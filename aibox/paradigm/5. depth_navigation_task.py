@@ -74,16 +74,15 @@ class DepthNavigationTaskController(controller.BraceletController):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-        print(df)
-
     def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
 
         # end trial
         if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
             trial_end_time = time.time()
-            print(f'Trial time: {trial_end_time - trial_start_time}')
             self.output_data.append(trial_end_time - trial_start_time)
             self.output_data.append(chr(pressed_key))
+
+            self.classes_obj = self.orig_classes_obj
             
             if pressed_key == ord('y'):
                 print("TRIAL SUCCESSFUL")
@@ -122,6 +121,7 @@ class DepthNavigationTaskController(controller.BraceletController):
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
         trial_start_time = -1 # placeholder initial value
+        self.orig_classes_obj = self.classes_obj
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -181,6 +181,10 @@ class DepthNavigationTaskController(controller.BraceletController):
                 # Update previous information
                 outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
 
+                if not self.ready_for_next_trial:
+                    hand_index_list = [hand + index_add for hand in self.classes_hand]
+                    outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
+
                 # Add depth placeholder to outputs
                 helper_list = []
                 for bb in outputs:
@@ -237,9 +241,8 @@ class DepthNavigationTaskController(controller.BraceletController):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    print('High change between frames. Resetting predictions.')
+                    #print('High change between frames. Resetting predictions.')
                     outputs = []
                 #cv2.imshow('Diff',diff)
                 #cv2.waitKey(0)
@@ -258,7 +261,6 @@ class DepthNavigationTaskController(controller.BraceletController):
                 if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
                     depthmap, _ = self.depth_estimator.predict_depth(im0)
                     outputs = controller.bbs_to_depth(im0, depthmap, outputs)
-                    print(f"Output: {[d for d in outputs if d[5] == 58]}")
                 else:
 
                     # Update depth values from previous outputs
@@ -311,12 +313,13 @@ class DepthNavigationTaskController(controller.BraceletController):
                     #playsound(str(file))
 
                 self.target_entered = True
+                self.classes_obj = [self.class_target_obj]
                 trial_start_time = time.time()
 
 
             # Navigate the hand based on information from last frame and current frame detections
             #grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depthmap, self.participant_vibration_intensities, self.metric)
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depthmap, self.participant_vibration_intensities, self.metric)
 
         # region visualization
             # Write results
@@ -329,7 +332,6 @@ class DepthNavigationTaskController(controller.BraceletController):
 
             # Target BB
             if curr_target is not None:
-                #print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:
@@ -460,7 +462,7 @@ if __name__ == '__main__':
                         nosave=True,  # do not save images/videos
                         classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
-                        class_hand_nav=[80,81],
+                        #class_hand_nav=[80,81],
                         agnostic_nms=False,  # class-agnostic NMS
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features

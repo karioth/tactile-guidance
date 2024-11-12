@@ -84,6 +84,9 @@ class GraspingTaskController(controller.BraceletController):
             print(f'Trial time: {trial_end_time - trial_start_time}')
             self.output_data.append(trial_end_time - trial_start_time)
             self.output_data.append(chr(pressed_key))
+
+            self.classes_obj = self.orig_classes_obj
+            print(self.classes_obj)
             
             if pressed_key == ord('y'):
                 print("TRIAL SUCCESSFUL")
@@ -122,6 +125,7 @@ class GraspingTaskController(controller.BraceletController):
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
         trial_start_time = -1 # placeholder initial value
+        self.orig_classes_obj = self.classes_obj
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -175,11 +179,19 @@ class GraspingTaskController(controller.BraceletController):
                 confs = preds[:, 4]
                 clss = preds[:, 5]
 
+            # Filter out outputs by removing objects with exact same center as hand
+            if len(pred_target[0]) > 0 and len(pred_hand[0]) > 0:
+                print("BOTH HAND AND TARGET DETECTED")
+
             # Generate tracker outputs for navigation
             if self.run_object_tracker:
                 
                 # Update previous information
                 outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
+                
+                if not self.ready_for_next_trial:
+                    hand_index_list = [hand + index_add for hand in self.classes_hand]
+                    outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
                 # Add depth placeholder to outputs
                 helper_list = []
@@ -239,18 +251,16 @@ class GraspingTaskController(controller.BraceletController):
                 std_diff = np.std(diff)
                 #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    print('High change between frames. Resetting predictions.')
+                    #print('High change between frames. Resetting predictions.')
                     outputs = []
                 #cv2.imshow('Diff',diff)
                 #cv2.waitKey(0)
 
             # Depth estimation (automatically skips revived bbs)
             if not self.run_depth_estimator:
-
                 depth_img = None
 
             else:
-                
                 depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
 
             # Set current tracking information as previous info
@@ -292,11 +302,15 @@ class GraspingTaskController(controller.BraceletController):
                     #playsound(str(file))
 
                 self.target_entered = True
+                self.classes_obj = [self.class_target_obj]
+                print(self.classes_obj)
                 trial_start_time = time.time()
 
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities)
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depth_img, self.participant_vibration_intensities)
+
+            print(f"OUTPUTS: {outputs}")
 
         # region visualization
             # Write results
@@ -319,7 +333,7 @@ class GraspingTaskController(controller.BraceletController):
             # Display results
             im0 = annotator.result()
             if self.view_img:
-                #cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
+                cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
                 #side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
                 #cv2.imshow("AIBox & Depth", side_by_side)
                 cv2.imshow("AIBox", im0)
@@ -373,14 +387,14 @@ if __name__ == '__main__':
     depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = False # Navigate without the bracelet using only print commands
+    mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
     run_object_tracker = True
     run_depth_estimator = False
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['cup', 'potted plant', 'apple']
+    target_objs = ['bottle', 'potted plant', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -437,10 +451,10 @@ if __name__ == '__main__':
                         conf_thres=0.7,  # confidence threshold
                         save_conf=False,  # save confidences in --save-txt labels
                         save_crop=False,  # save cropped prediction boxes
-                        nosave=False,  # do not save images/videos
-                        classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
+                        nosave=True,  # do not save images/videos
+                        classes_obj=[1,39,40,41,42,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
-                        class_hand_nav=[80,81],
+                        #class_hand_nav=[80,81],
                         agnostic_nms=False,  # class-agnostic NMS
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features
