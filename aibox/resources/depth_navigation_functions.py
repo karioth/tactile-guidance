@@ -41,6 +41,7 @@ def map_obstacles(handBB, targetBB, depth_map, metric):
 
     mask_rgb = cv2.cvtColor(expanded_obstacle_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
     cv2.imshow("expanded_obstacle_mask", mask_rgb)
+    cv2.setWindowProperty("expanded_obstacle_mask", cv2.WND_PROP_TOPMOST, 1)
     pressed_key = cv2.waitKey(1)
 
     return expanded_obstacle_mask
@@ -122,9 +123,9 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     print(np.max(dst_np))
 
     # visualize
-    corners_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    corners_rgb[dst>0.01*dst.max()]=[0,0,255]
-    cv2.imshow('corners',corners_rgb)
+    #corners_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+    #corners_rgb[dst>0.01*dst.max()]=[0,0,255]
+    #cv2.imshow('corners',corners_rgb)
 
     # Iterate through candidates
     min_y, min_x, max_x = -1, -1, -1
@@ -212,7 +213,12 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     roi_rgb[target_point[0], target_point[1]]=[0,0,255]
     cv2.circle(roi_rgb, (target_point[0], target_point[1]), radius=5, color=(0, 0, 255), thickness=-1)
     cv2.imshow("ROI", roi_rgb)
+    #cv2.setWindowProperty("ROI", cv2.WND_PROP_TOPMOST, 1)
     pressed_key = cv2.waitKey(1)
+
+    angle_radians = np.arctan2(yc_hand - target_point[1], target_point[0] - xc_hand) # inverted y-axis
+    angle = np.degrees(angle_radians) % 360
+    print(f'New angle: {angle}')
 
     #return [obstacle_x + int(min(xc_hand, xc_target)), obstacle_y]
     return target_point

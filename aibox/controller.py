@@ -30,13 +30,16 @@ from yolov5.utils.general import (LOGGER, Profile, check_file, check_img_size, c
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
+from ultralytics import YOLO
+from ultralytics.nn.autobackend import AutoBackend
 
 # DE
 from unidepth_estimator import UniDepthEstimator # metric
 from midas_estimator import MidasDepthEstimator # relative
 
 # Navigation
-from bracelet import navigate_hand, connect_belt
+#from bracelet import navigate_hand, connect_belt
+from bracelet import BraceletController, connect_belt
 # endregion
 
 # region Helpers
@@ -93,6 +96,7 @@ def bbs_to_depth(image, depth=None, bbs=None):
 
 def close_app(controller):
     print("Application will be closed")
+    controller.stop_vibration() if controller else None
     cv2.destroyAllWindows()
     # As far as I understood, all threads are properly closed by releasing their locks before being stopped
     threads = threading.enumerate()
@@ -114,7 +118,7 @@ class AutoAssign:
             setattr(self, key, value)
 
 
-class BraceletController(AutoAssign):
+class TaskController(AutoAssign):
 
     def __init__(self, **kwargs):
         
@@ -128,11 +132,15 @@ class BraceletController(AutoAssign):
         
         self.device = select_device(self.device)
         self.model_obj = DetectMultiBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
+        #self.model_obj = AutoBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
+        #self.model_obj = YOLO(self.weights_obj, task='detect')
+        #self.model_obj.to('cuda')
         self.model_hand = DetectMultiBackend(self.weights_hand, device=self.device, dnn=self.dnn, fp16=self.half)
 
-        self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
+        self.names_obj = self.model_obj.names        
+        #self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
         self.stride_hand, self.names_hand, self.pt_hand = self.model_hand.stride, self.model_hand.names, self.model_hand.pt
-        self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
+        #self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
         self.dt = (Profile(), Profile(), Profile())
 
         print(f'\nOBJECT DETECTORS LOADED SUCCESFULLY')
@@ -180,7 +188,8 @@ class BraceletController(AutoAssign):
         print(f'\nWARMING UP MODEL...')
 
         if type == 'detector':
-            model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
+            #model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
+            model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
         
         if type == 'tracker':
             model.warmup()
@@ -479,15 +488,17 @@ class BraceletController(AutoAssign):
         self.bs = 1  # batch_size
         view_img = check_imshow(warn=True)
         try:
-            self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+            #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+            self.dataset = LoadStreams(source, img_size=640)
         except AssertionError:
             while True:
                 change_camera = input(f'Failed to open camera with index {source}. Do you want to continue with webcam? (Y/N)')
-                if change_camera == 'Y':
+                if change_camera == 'y':
                     source = '0'
-                    self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+                    #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+                    self.dataset = LoadStreams(source, img_size=640)
                     break
-                elif change_camera == 'N':
+                elif change_camera == 'n':
                     exit()
         self.bs = len(self.dataset)
         vid_path, vid_writer = [None] * self.bs, [None] * self.bs
@@ -510,7 +521,7 @@ class BraceletController(AutoAssign):
             print('SKIPPING DEPTH ESTIMATOR INITIALIZATION')
 
         # Warmup models
-        self.warmup_model(self.model_obj)
+        #self.warmup_model(self.model_obj)
         self.warmup_model(self.model_hand)
         if self.run_object_tracker:
             self.warmup_model(self.tracker.model,'tracker')
