@@ -52,6 +52,8 @@ class BraceletController:
         self.frozen = False
         self.timer = 0
         self.vibrate = True
+        self.is_inside = False
+        self.is_touched = False
 
     def choose_detection(self, bboxes, previous_bbox=None, w=1920, h=1080):
         # Hyperparameters
@@ -91,7 +93,10 @@ class BraceletController:
             else:
                 candidates.append(0)
 
-        true_detection = bboxes[np.argmax(candidates)] if len(candidates) else previous_bbox
+        if self.is_inside or self.is_touched:
+            true_detection = bboxes[np.argmax(candidates)] if len(candidates) else previous_bbox
+        else:
+            true_detection = bboxes[np.argmax(candidates)] if len(candidates) else None
 
         return true_detection
 
@@ -196,11 +201,11 @@ class BraceletController:
         touched_right = hand_left <= target_right and hand_right >= target_right and hand_top <= target_bottom and hand_bottom >= target_top
         touched_top = hand_bottom >= target_top and hand_top <= target_top and hand_right >= target_left and hand_left <= target_right
         touched_bottom = hand_top <= target_bottom and hand_bottom >= target_bottom and hand_right >= target_left and hand_left <= target_right
-        is_inside = hand_left >= target_left and hand_right <= target_right and hand_top >= target_top and hand_bottom <= target_bottom
-        is_touched = touched_left or touched_right or touched_top or touched_bottom
+        self.is_inside = hand_left >= target_left and hand_right <= target_right and hand_top >= target_top and hand_bottom <= target_bottom
+        self.is_touched = touched_left or touched_right or touched_top or touched_bottom
 
         # If both BBs touch, keep frozen targetBB size
-        if is_touched or is_inside:
+        if self.is_touched or self.is_inside:
             frozen = True
             # only if the center of the hand is in the targetBB send the grasp signal
             if (target_left <= hand_x <= target_right) and (target_top <= hand_y <= target_bottom):

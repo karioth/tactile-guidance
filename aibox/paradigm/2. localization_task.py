@@ -14,20 +14,27 @@ import random
 
 from pybelt.belt_controller import (BeltOrientationType, BeltVibrationPattern)
 
-from bracelet import connect_belt
+from bracelet import connect_belt, BraceletController
 from controller import close_app
 
 # Define shapes with vertices
-shapes = {
+general_directions = {
     'left': [(0, 0), (-4, 0)],
     'right': [(0, 0), (4, 0)],
     'up': [(0, 0), (0, 4)],
-    'down': [(0, 0), (0, -4)],
-    'diagonal_1': [(0, 0), (3, 3)],
-    'diagonal_2': [(0, 0), (-3, 3)],
-    'diagonal_3': [(0, 0), (3, -3)],
-    'diagonal_4': [(0, 0), (-3, -3)],
-    '0': [(0, 0), (0, 4), (2, 4), (2, 0), (0, 0)],
+    'down': [(0, 0), (0, -4)]}
+
+diagonal_directions = {
+    'diagonal_tr': [(0, 0), (3, 3)],
+    'diagonal_tl': [(0, 0), (-3, 3)],
+    'diagonal_br': [(0, 0), (3, -3)],
+    'diagonal_bl': [(0, 0), (-3, -3)]
+}
+
+advanced_shapes = {'square': [(0,0), (0,1), (1,1), (1,0), (0,0)],
+                   'triangle': [(0,0), (1,2), (2,0), (0,0)]}
+
+"""advanced_shapes = {'0': [(0, 0), (0, 4), (2, 4), (2, 0), (0, 0)],
     '1': [(0, 0), (0, -2)],
     '2': [(0, 0), (2, 0), (2, -2), (0, -2), (0, -4), (2, -4)],
     '3': [(0, 0), (2, 0), (2, -2), (0, -2), (2, -2), (2, -4), (0, -4)],
@@ -57,8 +64,7 @@ shapes = {
     'v': [(0, 0), (2, -4), (4, 0)],
     'w': [(0, 0), (0, -4), (2, -2), (4, -4), (4, 0)],
     'y': [(0, 0), (2, -2), (4, 0), (0, -4)],
-    'z': [(0, 0), (2, 0), (0, -2), (2, -2)]
-}
+    'z': [(0, 0), (2, 0), (0, -2), (2, -2)]}"""
 
 # Define the categories and their items
 categories = {
@@ -282,6 +288,84 @@ def localization_task(categories, vibration_intensities):
             draw_shape(vibration_intensities, item)
             print("stop \n")
 
+def draw_shapes_bracelet(belt_controller, bracelet, shapes, randomize_order=False):
+
+    if randomize_order:
+        random.shuffle(shapes)
+
+    for shape in shapes:
+        print(shape)
+        vertices = shapes[shape]
+        #vertices = vertices +  vertices[0]
+        print(vertices)
+
+        for i in range(len(vertices) - 1):    
+
+            print(f'start: {vertices[i]}, end: {vertices[i+1]}')
+            right_int, left_int, bot_int, top_int, _ = bracelet.get_intensity(vertices[i], vertices[i+1], bracelet.vibration_intensities, None) # mirroring left and right intensities as well as top and bottom
+            print(f'intensities: R {right_int}, L {left_int}, T {top_int}, B {bot_int}')
+
+            trial_start_time = time.time()
+
+            belt_controller.send_vibration_command(
+                channel_index=0,
+                pattern=BeltVibrationPattern.CONTINUOUS,
+                intensity=right_int,
+                orientation_type=BeltOrientationType.ANGLE,
+                orientation=120,
+                pattern_iterations=None,
+                pattern_period=500,
+                pattern_start_time=0,
+                exclusive_channel=False,
+                clear_other_channels=False
+            )
+            belt_controller.send_vibration_command(
+                channel_index=1,
+                pattern=BeltVibrationPattern.CONTINUOUS,
+                intensity=left_int,
+                orientation_type=BeltOrientationType.ANGLE,
+                orientation=45,
+                pattern_iterations=None,
+                pattern_period=500,
+                pattern_start_time=0,
+                exclusive_channel=False,
+                clear_other_channels=False
+            )
+            belt_controller.send_vibration_command(
+                channel_index=2,
+                pattern=BeltVibrationPattern.CONTINUOUS,
+                intensity=top_int,
+                orientation_type=BeltOrientationType.ANGLE,
+                orientation=90,
+                pattern_iterations=None,
+                pattern_period=500,
+                pattern_start_time=0,
+                exclusive_channel=False,
+                clear_other_channels=False
+            )
+            belt_controller.send_vibration_command(
+                channel_index=3,
+                pattern=BeltVibrationPattern.CONTINUOUS,
+                intensity=bot_int,
+                orientation_type=BeltOrientationType.ANGLE,
+                orientation=60,
+                pattern_iterations=None,
+                pattern_period=500,
+                pattern_start_time=0,
+                exclusive_channel=False,
+                clear_other_channels=False
+            )
+            
+            while True:
+                
+                if time.time() > trial_start_time + 2:
+                    belt_controller.stop_vibration()
+                    break
+
+            time.sleep(1)
+
+    belt_controller.stop_vibration()
+
 
 if __name__ == '__main__':
     participant = 1
@@ -294,12 +378,13 @@ if __name__ == '__main__':
         print('Calibration intensities loaded succesfully.')
     except:
         while True:
-            continue_with_baseline = input('Error while loading the calibration file. Do you want to continue with baseline intensity of 50 for each vibromotor? (y/n)')
+            baseline_intensity = 50
+            continue_with_baseline = input(f'Error while loading the calibration file. Do you want to continue with baseline intensity of {baseline_intensity} for each vibromotor? (y/n)')
             if continue_with_baseline == 'y':
-                participant_vibration_intensities = {'bottom': 50,
-                                                     'top': 50,
-                                                     'left': 50,
-                                                     'right': 50}
+                participant_vibration_intensities = {'bottom': baseline_intensity,
+                                                     'top': baseline_intensity,
+                                                     'left': baseline_intensity,
+                                                     'right': baseline_intensity}
                 break
             elif continue_with_baseline == 'n':
                 sys.exit()
@@ -318,7 +403,17 @@ if __name__ == '__main__':
                 sys.exit()
 
     try:
-        localization_task(categories, participant_vibration_intensities)
+        #localization_task(categories, participant_vibration_intensities)
+        bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
+
+        while True:
+            condition = input('Select condition: g - general directions, d - diagonals, s - shapes:')
+            if condition == 'g':
+                draw_shapes_bracelet(belt_controller, bracelet_controller, general_directions)
+            elif condition == 'd':
+                draw_shapes_bracelet(belt_controller, bracelet_controller, diagonal_directions)
+            elif condition == 's':
+                draw_shapes_bracelet(belt_controller, bracelet_controller, advanced_shapes)
 
     except KeyboardInterrupt:
         close_app(belt_controller)

@@ -195,7 +195,7 @@ class GraspingTaskController(controller.TaskController):
                 clss = preds[:, 5]
 
             # Filter out outputs by removing objects with exact same center as hand
-            if len(pred_target[0]) > 0 and len(pred_hand[0]) > 0:
+            if len(pred_target[0]) > 0 and len(pred_hand[0]) > 0 and not grasped:
                 print("BOTH HAND AND TARGET DETECTED")
 
             # Generate tracker outputs for navigation
@@ -419,7 +419,7 @@ if __name__ == '__main__':
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['cup', 'bottle', 'potted plant', 'apple']
+    target_objs = ['cup', 'cup', 'bottle', 'potted plant', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
