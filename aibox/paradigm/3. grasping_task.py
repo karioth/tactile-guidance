@@ -194,10 +194,6 @@ class GraspingTaskController(controller.TaskController):
                 confs = preds[:, 4]
                 clss = preds[:, 5]
 
-            # Filter out outputs by removing objects with exact same center as hand
-            if len(pred_target[0]) > 0 and len(pred_hand[0]) > 0 and not grasped:
-                print("BOTH HAND AND TARGET DETECTED")
-
             # Generate tracker outputs for navigation
             if self.run_object_tracker:
                 
@@ -328,13 +324,19 @@ class GraspingTaskController(controller.TaskController):
                 print(self.classes_obj)
                 grasped = False
                 trial_start_time = time.time()
-
+                vibration_timer = None
 
             # Navigate the hand based on information from last frame and current frame detections
             if not grasped:
                 grasped, curr_target = self.bracelet_controller.navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depth_img, self.participant_vibration_intensities)
             else: # if grasping signal was sent stop navigation process and reset target
-                grasped, curr_target = True, None
+                if vibration_timer is None:
+                    vibration_timer = time.time()
+                    grasped, curr_target = True, None
+                elif vibration_timer > 0:
+                    if time.time() - vibration_timer > 1.5:
+                        self.belt_controller.stop_vibration()
+                        vibration_timer = -1
 
         # region visualization
             # Write results
@@ -419,7 +421,7 @@ if __name__ == '__main__':
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['cup', 'cup', 'bottle', 'potted plant', 'apple']
+    target_objs = ['bowl', 'clock', 'potted plant'] * 3
 
     participant = 1
     output_path = str(parent_dir) + '/results/'

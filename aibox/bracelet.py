@@ -55,7 +55,7 @@ class BraceletController:
         self.is_inside = False
         self.is_touched = False
 
-    def choose_detection(self, bboxes, previous_bbox=None, w=1920, h=1080):
+    def choose_detection(self, bboxes, previous_bbox=None, hand=False, w=1920, h=1080):
         # Hyperparameters
         track_id_weight = 1000
         exponential_weight = 2
@@ -93,12 +93,12 @@ class BraceletController:
             else:
                 candidates.append(0)
 
-        if self.is_inside or self.is_touched:
-            true_detection = bboxes[np.argmax(candidates)] if len(candidates) else previous_bbox
+        if len(candidates) == 0 and hand:
+            return None
+        if (self.is_inside or self.is_touched) and not hand:
+            return bboxes[np.argmax(candidates)] if len(candidates) else previous_bbox
         else:
-            true_detection = bboxes[np.argmax(candidates)] if len(candidates) else None
-
-        return true_detection
+            return bboxes[np.argmax(candidates)] if len(candidates) else None
 
     def calibrate_intensity(self):
         # to be implemented
@@ -129,6 +129,46 @@ class BraceletController:
 
         max_bottom_intensity, max_top_intensity, max_left_intensity, max_right_intensity = vibration_intensities["bottom"], vibration_intensities["top"], vibration_intensities["left"], vibration_intensities["right"]
 
+        # Octants
+        if 0 <= angle < 45:
+            right_intensity = max_right_intensity
+            top_intensity = (angle - 0) / 45 * max_top_intensity
+        elif angle == 45:
+            right_intensity = max_right_intensity
+            top_intensity = max_top_intensity
+        elif 45 < angle < 90:
+            right_intensity = (90 - angle) / 45 * max_right_intensity
+            top_intensity = max_top_intensity
+        elif 90 <= angle < 135:
+            top_intensity = max_top_intensity
+            left_intensity = (angle - 90) / 45 * max_left_intensity
+        elif angle == 135:
+            top_intensity = max_top_intensity
+            left_intensity = max_left_intensity
+        elif 135 < angle < 180:
+            top_intensity = (180 - angle) / 45 * max_top_intensity
+            left_intensity = max_left_intensity
+        elif 180 <= angle < 225:
+            left_intensity = max_left_intensity
+            bottom_intensity = (angle - 180) / 45 * max_bottom_intensity
+        elif angle == 225:
+            left_intensity = max_left_intensity
+            bottom_intensity = max_bottom_intensity
+        elif 225 < angle < 270:
+            left_intensity = (270 - angle) / 45 * max_left_intensity
+            bottom_intensity = max_bottom_intensity
+        elif 270 <= angle < 315:
+            bottom_intensity = max_bottom_intensity
+            right_intensity = (angle - 270) / 45 * max_right_intensity
+        elif angle == 315:
+            bottom_intensity = max_bottom_intensity
+            right_intensity = max_right_intensity
+        elif 315 < angle <= 360:
+            bottom_intensity = (360 - angle) / 45 * max_bottom_intensity
+            right_intensity = max_right_intensity
+
+
+        '''
         # Calculate motor intensities based on the angle
         if 0 <= angle < 90:
             right_intensity = (90 - angle) / 90 * max_right_intensity
@@ -142,6 +182,7 @@ class BraceletController:
         elif 270 <= angle < 360:
             bottom_intensity = (360 - angle) / 90 * max_bottom_intensity
             right_intensity = (angle - 270) / 90 * max_right_intensity
+        '''
 
         if type(depth_img) != None:
             return int(right_intensity), int(left_intensity), int(top_intensity), int(bottom_intensity), 50
@@ -241,12 +282,12 @@ class BraceletController:
         # Search for object and hand with the highest prediction confidence
         ## Filter for hand detections
         bboxes_hands = [detection for detection in bboxes if detection[5] in hand_clss]
-        hand = self.choose_detection(bboxes_hands, self.prev_hand)
+        hand = self.choose_detection(bboxes_hands, self.prev_hand, hand=True)
         self.prev_hand = hand
 
         ## Filter for target detections
         bboxes_objects = [detection for detection in bboxes if detection[5] == target_cls]
-        target = self.choose_detection(bboxes_objects, self.prev_target)
+        target = self.choose_detection(bboxes_objects, self.prev_target, hand=False)
         self.prev_target = target
 
         if hand is not None and target is not None:
@@ -276,6 +317,16 @@ class BraceletController:
                 overlapping, self.frozen_x, self.frozen_y, self.frozen_w, self.frozen_h, self.frozen = self.check_overlap(hand, frozenBB, self.frozen)
                 frozen_target[:4] = frozenBB
 
+        elif hand is None:
+            frozen_target = None
+            self.frozen = False
+            self.is_inside = False
+            self.is_touched = False
+            if belt_controller and self.vibrate:
+                belt_controller.stop_vibration()
+
+        print(hand)
+
         # 1. Grasping
         if overlapping:
             self.searching = True
@@ -298,7 +349,7 @@ class BraceletController:
                 self.vibrate = False
                 print(f'Previous target: {self.prev_target}')
                 self.prev_target = None
-                #frozen_target = None
+                frozen_target = None
             print("G R A S P !")
             return overlapping, frozen_target
 
