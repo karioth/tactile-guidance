@@ -113,7 +113,8 @@ class GraspingTaskController(controller.TaskController):
             self.bracelet_controller.vibrate = True
         # end experiment
         elif pressed_key == ord('q'):
-            self.belt_controller.stop_vibration()
+            if self.belt_controller:
+                self.belt_controller.stop_vibration()
             return "break"
     
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
@@ -214,6 +215,7 @@ class GraspingTaskController(controller.TaskController):
                 outputs = helper_list
                 """
 
+                """
                 # Get previous tracking information
                 prev_track_ids = []
                 if prev_outputs.size > 0:
@@ -246,6 +248,7 @@ class GraspingTaskController(controller.TaskController):
                                 if isinstance(outputs, np.ndarray):
                                     outputs = outputs.tolist()
                                 outputs.append(revived_detection)
+                """
 
                 # Convert BBs to xywh
                 for bb in outputs:
@@ -335,7 +338,8 @@ class GraspingTaskController(controller.TaskController):
                     grasped, curr_target = True, None
                 elif vibration_timer > 0:
                     if time.time() - vibration_timer > 1.5:
-                        self.belt_controller.stop_vibration()
+                        if self.belt_controller:
+                            self.belt_controller.stop_vibration()
                         vibration_timer = -1
 
         # region visualization
@@ -414,14 +418,14 @@ if __name__ == '__main__':
     depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = False # Navigate without the bracelet using only print commands
+    mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
     run_object_tracker = False
     run_depth_estimator = False
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['bowl', 'clock', 'potted plant'] * 3
+    target_objs = ['bottle', 'clock', 'potted plant'] * 3
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -502,7 +506,7 @@ if __name__ == '__main__':
                         run_depth_estimator=run_depth_estimator,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
-                        tracker_max_age=20,
+                        tracker_max_age=60,
                         tracker_n_init=5,
                         target_objs=target_objs,
                         output_data=[],
