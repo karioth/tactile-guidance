@@ -48,7 +48,7 @@ def calibrate_intensity(direction):
         elif keyboard.is_pressed('down') and intensity > 5: # no reason to vibrate with intensity of 0
             intensity -= 5
             time.sleep(0.1)
-        elif keyboard.is_pressed('q'):
+        elif keyboard.is_pressed('y'):
             belt_controller.stop_vibration()
             time.sleep(1)
             return intensity

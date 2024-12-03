@@ -20,8 +20,6 @@ sys.path.append(str(parent_dir) + '/yolov5')
 sys.path.append(str(parent_dir) + '/strongsort')
 sys.path.append(str(parent_dir) + '/MiDaS')
 
-os.chdir(parent_dir)
-
 # Navigation
 import controller
 
@@ -54,23 +52,21 @@ from yolov5.utils.general import (LOGGER, Profile, check_file, check_img_size, c
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
-from ultralytics.utils.ops import non_max_suppression as nms
 
 # DE
 from midas.midas.model_loader import default_models, load_model
 from midas.run import create_side_by_side, process
 
 # Navigation
-#from bracelet import navigate_hand, connect_belt
-from bracelet import BraceletController, connect_belt
+from bracelet import navigate_hand, connect_belt
 
-class GraspingTaskController(controller.TaskController):
+class MultipleObjectsTaskController(controller.BraceletController):
 
     def save_output_data(self):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-        df.to_csv(self.output_path + f"grasping_task_participant_{self.participant}.csv")
+        df.to_csv(self.output_path + f"multiple_objects_task_participant_{self.participant}.csv")
 
     def print_output_data(self):
 
@@ -86,11 +82,6 @@ class GraspingTaskController(controller.TaskController):
             print(f'Trial time: {trial_end_time - trial_start_time}')
             self.output_data.append(trial_end_time - trial_start_time)
             self.output_data.append(chr(pressed_key))
-
-            self.classes_obj = self.orig_classes_obj
-            print(self.classes_obj)
-
-            self.bracelet_controller.frozen = False
             
             if pressed_key == ord('y'):
                 print("TRIAL SUCCESSFUL")
@@ -110,11 +101,8 @@ class GraspingTaskController(controller.TaskController):
             print("STARTING NEXT TRIAL")
             self.target_entered = False
             self.ready_for_next_trial = False
-            self.bracelet_controller.vibrate = True
         # end experiment
         elif pressed_key == ord('q'):
-            if self.belt_controller:
-                self.belt_controller.stop_vibration()
             return "break"
     
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
@@ -132,9 +120,6 @@ class GraspingTaskController(controller.TaskController):
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
         trial_start_time = -1 # placeholder initial value
-        self.orig_classes_obj = self.classes_obj
-
-        grasped = False
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -150,8 +135,7 @@ class GraspingTaskController(controller.TaskController):
             # Image pre-processing
             with self.dt[0]:
                 image = torch.from_numpy(im).to(self.model_obj.device)
-                #image = image.half() if self.model_obj.fp16 else image.float()  # uint8 to fp16/32
-                image = image.half() if self.model_hand.fp16 else image.float()
+                image = image.half() if self.model_obj.fp16 else image.float()  # uint8 to fp16/32
                 image /= 255  # 0 - 255 to 0.0 - 1.0
                 if len(image.shape) == 3:
                     image = image[None]  # expand for batch dim
@@ -159,13 +143,12 @@ class GraspingTaskController(controller.TaskController):
             # Object detection inference
             with self.dt[1]:
                 visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
-                pred_target = self.model_obj(image, augment=self.augment, visualize=visualize) # YOLO11 runs nms by default
+                pred_target = self.model_obj(image, augment=self.augment, visualize=visualize)
                 pred_hand = self.model_hand(image, augment=self.augment, visualize=visualize)
 
             # Non-maximal supression
             with self.dt[2]:
                 pred_target = non_max_suppression(pred_target, self.conf_thres, self.iou_thres, self.classes_obj, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
-                #pred_target = nms(pred_target, self.conf_thres, self.iou_thres, self.classes_obj, self.agnostic_nms, max_det=self.max_det)
                 pred_hand = non_max_suppression(pred_hand, self.conf_thres, self.iou_thres, self.classes_hand, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
 
             for hand in pred_hand[0]:
@@ -183,11 +166,6 @@ class GraspingTaskController(controller.TaskController):
             clss = torch.empty(0)
 
             # Process object detections
-            #print(pred_target[0])
-            #print(pred_hand[0])
-            #targets = torch.from_numpy(pred_target[0].orig_img)
-            #print(targets)
-            #preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)
             preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)
             if len(preds) > 0:
                 preds[:, :4] = scale_boxes(im.shape[2:], preds[:, :4], im0.shape).round()
@@ -200,22 +178,14 @@ class GraspingTaskController(controller.TaskController):
                 
                 # Update previous information
                 outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
-                
-                if not self.ready_for_next_trial:
-                    hand_index_list = [hand + index_add for hand in self.classes_hand]
-                    outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
                 # Add depth placeholder to outputs
-                outputs = [np.append(bb, -1) for bb in outputs]
-                """
                 helper_list = []
                 for bb in outputs:
                     bb = np.append(bb, -1)
                     helper_list.append(bb)
                 outputs = helper_list
-                """
 
-                """
                 # Get previous tracking information
                 prev_track_ids = []
                 if prev_outputs.size > 0:
@@ -248,7 +218,6 @@ class GraspingTaskController(controller.TaskController):
                                 if isinstance(outputs, np.ndarray):
                                     outputs = outputs.tolist()
                                 outputs.append(revived_detection)
-                """
 
                 # Convert BBs to xywh
                 for bb in outputs:
@@ -256,13 +225,9 @@ class GraspingTaskController(controller.TaskController):
 
             # without tracking
             else:
-                outputs = np.array(preds.cpu())
+                outputs = np.array(preds)
                 outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder
                 outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf columns for alignment with tracker
-                outputs = [np.append(bb, -1) for bb in outputs]
-
-                for bb in outputs:
-                    bb[:4] = xyxy2xywh(bb[:4])
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -272,16 +237,18 @@ class GraspingTaskController(controller.TaskController):
                 std_diff = np.std(diff)
                 #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    #print('High change between frames. Resetting predictions.')
+                    print('High change between frames. Resetting predictions.')
                     outputs = []
                 #cv2.imshow('Diff',diff)
                 #cv2.waitKey(0)
 
             # Depth estimation (automatically skips revived bbs)
             if not self.run_depth_estimator:
+
                 depth_img = None
 
             else:
+                
                 depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
 
             # Set current tracking information as previous info
@@ -323,24 +290,11 @@ class GraspingTaskController(controller.TaskController):
                     #playsound(str(file))
 
                 self.target_entered = True
-                self.classes_obj = [self.class_target_obj]
-                print(self.classes_obj)
-                grasped = False
                 trial_start_time = time.time()
-                vibration_timer = None
+
 
             # Navigate the hand based on information from last frame and current frame detections
-            if not grasped:
-                grasped, curr_target = self.bracelet_controller.navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depth_img, self.participant_vibration_intensities)
-            else: # if grasping signal was sent stop navigation process and reset target
-                if vibration_timer is None:
-                    vibration_timer = time.time()
-                    grasped, curr_target = True, None
-                elif vibration_timer > 0:
-                    if time.time() - vibration_timer > 1.5:
-                        if self.belt_controller:
-                            self.belt_controller.stop_vibration()
-                        vibration_timer = -1
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities)
 
         # region visualization
             # Write results
@@ -367,7 +321,6 @@ class GraspingTaskController(controller.TaskController):
                 #side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
                 #cv2.imshow("AIBox & Depth", side_by_side)
                 cv2.imshow("AIBox", im0)
-                cv2.setWindowProperty("AIBox", cv2.WND_PROP_TOPMOST, 1)
 
                 pressed_key = cv2.waitKey(1)
 
@@ -377,8 +330,8 @@ class GraspingTaskController(controller.TaskController):
                 
                 if trial_info == "break":
                     try:
-                        task_controller.print_output_data()
-                        task_controller.save_output_data()
+                        bracelet_controller.print_output_data()
+                        bracelet_controller.save_output_data()
                     except ValueError:
                         pass
                     break
@@ -397,7 +350,7 @@ class GraspingTaskController(controller.TaskController):
                             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
-                            fps, w, h = 8, im0.shape[1], im0.shape[0] # int(np.mean(fpss))
+                            fps, w, h = 30, im0.shape[1], im0.shape[0]
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[0] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[0].write(im0)
@@ -418,14 +371,14 @@ if __name__ == '__main__':
     depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
+    mock_navigate = False # Navigate without the bracelet using only print commands
     belt_controller = None
-    run_object_tracker = False
+    run_object_tracker = True
     run_depth_estimator = False
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['bottle', 'clock', 'potted plant'] * 3
+    target_objs = ['cup', 'bottle', 'cup', 'apple']
 
     participant = 1
     output_path = str(parent_dir) + '/results/'
@@ -460,7 +413,7 @@ if __name__ == '__main__':
 
     # Check bracelet connection
     if not mock_navigate:
-        connection_check, belt_controller = connect_belt()
+        connection_check, belt_controller = controller.connect_belt()
         if connection_check:
             print('Bracelet connection successful.')
         else:
@@ -468,9 +421,7 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
-
-        task_controller = GraspingTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+        bracelet_controller = MultipleObjectsTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
                         depth_estimator=depth_estimator,
@@ -484,10 +435,10 @@ if __name__ == '__main__':
                         conf_thres=0.7,  # confidence threshold
                         save_conf=False,  # save confidences in --save-txt labels
                         save_crop=False,  # save cropped prediction boxes
-                        nosave=True,  # do not save images/videos
-                        classes_obj=[1,39,40,41,42,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
+                        nosave=False,  # do not save images/videos
+                        classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
-                        #class_hand_nav=[80,81],
+                        class_hand_nav=[80,81],
                         agnostic_nms=False,  # class-agnostic NMS
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features
@@ -506,16 +457,15 @@ if __name__ == '__main__':
                         run_depth_estimator=run_depth_estimator,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
-                        tracker_max_age=60,
+                        tracker_max_age=10,
                         tracker_n_init=5,
                         target_objs=target_objs,
                         output_data=[],
                         output_path=output_path,
                         participant=participant,
-                        participant_vibration_intensities=participant_vibration_intensities,
-                        bracelet_controller=bracelet_controller) # debugging
+                        participant_vibration_intensities=participant_vibration_intensities) # debugging
         
-        task_controller.run()
+        bracelet_controller.run()
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)

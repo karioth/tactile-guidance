@@ -1,21 +1,45 @@
+"""
+This script is using code from the following sources:
+- YOLOv5 🚀 by Ultralytics, AGPL-3.0 license, https://github.com/ultralytics/yolov5
+- StrongSORT MOT, https://github.com/dyhBUPT/StrongSORT, https://pypi.org/project/strongsort/
+- Youtube Tutorial "Simple YOLOv8 Object Detection & Tracking with StrongSORT & ByteTrack" by Nicolai Nielsen, https://www.youtube.com/watch?v=oDALtKbprHg
+- https://github.com/zenjieli/Yolov5StrongSORT/blob/master/track.py, original: https://github.com/mikel-brostrom/yolo_tracking/commit/9fec03ddba453959f03ab59bffc36669ae2e932a
+"""
+
 # region Setup
+
 # System
 import sys
+import os
 from pathlib import Path
 
 # Use the project file packages instead of the conda packages, i.e. add to system path for import
-file = Path(__file__).resolve()
-root = file.parents[0]
-sys.path.append(str(root) + '/yolov5')
-sys.path.append(str(root) + '/strongsort')
-sys.path.append(str(root) + '/unidepth')
-sys.path.append(str(root) + '/midas')
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(parent_dir)
+sys.path.append(str(parent_dir) + '/yolov5')
+sys.path.append(str(parent_dir) + '/strongsort')
+sys.path.append(str(parent_dir) + '/MiDaS')
+
+os.chdir(parent_dir)
+
+# Navigation
+import controller
 
 # Utility
-import time
-import numpy as np
+import keyboard
 from playsound import playsound
 import threading
+
+# endregion
+
+# region Task
+
+import numpy as np
+import time
+
+# Output data
+import pandas as pd
+import json
 
 # Image processing
 import cv2
@@ -30,173 +54,58 @@ from yolov5.utils.general import (LOGGER, Profile, check_file, check_img_size, c
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
-from ultralytics import YOLO
-from ultralytics.nn.autobackend import AutoBackend
 
 # DE
-from unidepth_estimator import UniDepthEstimator # metric
-from midas_estimator import MidasDepthEstimator # relative
+from midas.midas.model_loader import default_models, load_model
+from midas.run import create_side_by_side, process
 
 # Navigation
-#from bracelet import navigate_hand, connect_belt
-from bracelet import BraceletController, connect_belt
-# endregion
+from bracelet import navigate_hand, connect_belt
 
-# region Helpers
+class DepthNavigationTaskController(controller.BraceletController):
 
-def playstart():
-    file = 'resources/sound/beginning.mp3' # ROOT
-    playsound(str(file))
+    def save_output_data(self):
 
+        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-def play_start():
-    play_start_thread = threading.Thread(target=playstart, name='play_start')
-    play_start_thread.start()
+        df.to_csv(self.output_path + f"depth_navigation_task_participant_{self.participant}.csv")
 
+    def print_output_data(self):
 
-def bbs_to_depth(image, depth=None, bbs=None):
-    """
-    Calculate the mean depth for bounding boxes (BBs) in an image.
+        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
 
-    Parameters:
-    image (numpy.ndarray): The input image.
-    depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
-    bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
-                                    as a list of 8 values [x, y, w, h, ... , mean_depth]. Defaults to None.
-    Returns:
-    numpy.ndarray: An array of bounding boxes with updated mean depth values.
-                   If no bounding boxes are provided, returns None.
-    Notes:
-    - If a bounding box already has a mean depth value (indicated by the 8th value not being -1), 
-      it will be left unchanged.
-    - The mean depth is calculated for the region of interest (ROI) defined by the bounding box 
-      in the depth map.
-    - If no bounding boxes are provided, a message will be printed and None will be returned.
-    """
+    def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
 
-    if bbs is not None:
-        outputs = []
-        for bb in bbs:
-            if bb[7] == -1: # if already 8 values, depth has already been calculated (revived bb)
-                x,y,w,h = [int(coord) for coord in bb[:4]]
-                x2 = x+(w//2)
-                y2 = y+(h//2)
-                roi = depth[y:y2, x:x2]
-                mean_depth = np.mean(roi)
-                #median_depth = np.median(roi)
-                bb[7] = mean_depth
-                outputs.append(bb)
+        # end trial
+        if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
+            trial_end_time = time.time()
+            self.output_data.append(trial_end_time - trial_start_time)
+            self.output_data.append(chr(pressed_key))
+
+            self.classes_obj = self.orig_classes_obj
+            
+            if pressed_key == ord('y'):
+                print("TRIAL SUCCESSFUL")
+            elif pressed_key == ord('n'):
+                print("TRIAL FAILED")
+            
+            if self.obj_index >= len(self.target_objs) - 1:
+                print("ALL TARGETS COVERED")
+                return "break"
             else:
-                outputs.append(bb)
-        return np.array(outputs)
-    else:
-        print('There are no BBs to calculate the depth for.')
-        return None
-
-
-def close_app(controller):
-    print("Application will be closed")
-    controller.stop_vibration() if controller else None
-    cv2.destroyAllWindows()
-    # As far as I understood, all threads are properly closed by releasing their locks before being stopped
-    threads = threading.enumerate()
-    for thread in threads:
-        thread._tstate_lock = None
-        thread._stop()
-    controller.disconnect_belt() if controller else None
-    sys.exit()
-
-# endregion
-
-# region BraceletController class
-
-class AutoAssign:
-
-    def __init__(self, **kwargs):
-        
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-
-class TaskController(AutoAssign):
-
-    def __init__(self, **kwargs):
-        
-        super().__init__(**kwargs)
-
-    # region models loaders
-
-    def load_object_detector(self):
-        
-        print(f'\nLOADING OBJECT DETECTORS')
-        
-        self.device = select_device(self.device)
-        self.model_obj = DetectMultiBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
-        #self.model_obj = AutoBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
-        #self.model_obj = YOLO(self.weights_obj, task='detect')
-        #self.model_obj.to('cuda')
-        self.model_hand = DetectMultiBackend(self.weights_hand, device=self.device, dnn=self.dnn, fp16=self.half)
-
-        self.names_obj = self.model_obj.names        
-        #self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
-        self.stride_hand, self.names_hand, self.pt_hand = self.model_hand.stride, self.model_hand.names, self.model_hand.pt
-        #self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
-        self.dt = (Profile(), Profile(), Profile())
-
-        print(f'\nOBJECT DETECTORS LOADED SUCCESFULLY')
-
-
-    def load_object_tracker(self, max_age=70, n_init=3):
-
-        print(f'\nLOADING OBJECT TRACKER')
-        
-        self.tracker = StrongSORT(
-                model_weights=self.weights_tracker, 
-                device=self.device,
-                fp16=False,
-                max_dist=0.5,          # The matching threshold. Samples with larger distance are considered an invalid match
-                max_iou_distance=0.7,  # Gating threshold. Associations with cost larger than this value are disregarded.
-                max_age=max_age,       # Maximum number of missed misses (prediction calls, i.e. frames) before a track is deleted
-                n_init=n_init,         # Number of frames that a track remains in initialization phase --> if 0, track is confirmed on first detection
-                nn_budget=100,         # Maximum size of the appearance descriptors gallery
-                mc_lambda=0.995,       # matching with both appearance (1 - MC_LAMBDA) and motion cost
-                ema_alpha=0.9          # updates  appearance  state in  an exponential moving average manner
-                )
-        
-        print(f'\nOBJECT TRACKER LOADED SUCCESFULLY')
-
-
-    def load_depth_estimator(self):
-        
-        print(f'\nLOADING DEPTH ESTIMATOR')
-        if self.metric:
-            self.depth_estimator = UniDepthEstimator(
-                model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
-                device=self.device
-            )
-        else:
-            self.depth_estimator = MidasDepthEstimator(
-                model_type = self.weights_depth_estimator, # midas_v21_384, dpt_levit_224
-                device=self.device
-            )
-
-        print(f'\nDEPTH ESTIMATOR LOADED SUCCESFULLY')
-        
-
-    def warmup_model(self, model, type='detector'):
-
-        print(f'\nWARMING UP MODEL...')
-
-        if type == 'detector':
-            #model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
-            model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
-        
-        if type == 'tracker':
-            model.warmup()
-
-    # endregion
-
-
+                print("MOVING TO NEXT TARGET")
+                self.obj_index += 1
+                self.ready_for_next_trial = True
+                self.class_target_obj = -1
+        # start next trial
+        elif pressed_key == ord('s') and self.ready_for_next_trial:
+            print("STARTING NEXT TRIAL")
+            self.target_entered = False
+            self.ready_for_next_trial = False
+        # end experiment
+        elif pressed_key == ord('q'):
+            return "break"
+    
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
 
         print(f'\nSTARTING MAIN LOOP')
@@ -208,10 +117,14 @@ class TaskController(AutoAssign):
         outputs = []
         prev_outputs = np.array([])
 
+        self.ready_for_next_trial = True
+        self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
+        self.class_target_obj = -1 # placeholder value not assigned to any specific object
+        trial_start_time = -1 # placeholder initial value
+        self.orig_classes_obj = self.classes_obj
+
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
-
-            print(f'Frame {frame+1}')
 
             # Start timer for FPS measure
             start = time.perf_counter()
@@ -267,6 +180,10 @@ class TaskController(AutoAssign):
                 
                 # Update previous information
                 outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
+
+                if not self.ready_for_next_trial:
+                    hand_index_list = [hand + index_add for hand in self.classes_hand]
+                    outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
                 # Add depth placeholder to outputs
                 helper_list = []
@@ -328,14 +245,22 @@ class TaskController(AutoAssign):
                     #print('High change between frames. Resetting predictions.')
                     outputs = []
                 #cv2.imshow('Diff',diff)
-                #cv2.waitKey(0)    
+                #cv2.waitKey(0)
 
+            # Depth estimation (automatically skips revived bbs)
+            #if not self.run_depth_estimator:
+
+            #    depth_img = None
+
+            #else:
+                
+            #    depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
 
             # Depth estimation (automatically skips revived bbs)
             if self.run_depth_estimator:
                 if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
                     depthmap, _ = self.depth_estimator.predict_depth(im0)
-                    outputs = bbs_to_depth(im0, depthmap, outputs)
+                    outputs = controller.bbs_to_depth(im0, depthmap, outputs)
                 else:
 
                     # Update depth values from previous outputs
@@ -374,7 +299,7 @@ class TaskController(AutoAssign):
 
                         if target_obj_verb in coco_labels.values():
                             user_in = input("Selected object is " + target_obj_verb + ". Correct? [y,n]")
-                            class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
+                            self.class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
                             file = f'resources/sound/{target_obj_verb}.mp3'
                             #playsound(str(file))
                             # Start trial time measure (end in navigate_hand(...))
@@ -382,21 +307,19 @@ class TaskController(AutoAssign):
                             print(f'The object {target_obj_verb} is not in the list of available targets. Please reselect.')
                 else:
                     target_obj_verb = self.target_objs[self.obj_index]
-                    class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
+                    self.class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
                     file = f'resources/sound/{target_obj_verb}.mp3'
+                    self.output_data.append(self.class_target_obj)
                     #playsound(str(file))
-                    # Start trial time measure (end in navigate_hand(...))
 
                 self.target_entered = True
+                self.classes_obj = [self.class_target_obj]
+                trial_start_time = time.time()
+
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, class_target_obj, self.class_hand_nav, depthmap, self.metric)
-        
-            # Exit the loop if hand and object aligned horizontally and vertically and grasp signal was sent
-            if grasped:
-                if self.manual_entry and ((self.obj_index+1)<=len(self.target_objs)):
-                    self.obj_index += 1
-                self.target_entered = False
+            #grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
+            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depthmap, self.participant_vibration_intensities, self.metric)
 
         # region visualization
             # Write results
@@ -418,15 +341,22 @@ class TaskController(AutoAssign):
             # Display results
             im0 = annotator.result()
             if self.view_img:
-                #cv2.namedWindow("AIBox", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO) # for resizing
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                if self.run_depth_estimator:
-                    side_by_side = self.depth_estimator.create_depthmap(im0, depthmap, False) # original image & depth side-by-side
-                    cv2.imshow("AIBox & Depthmap", side_by_side)
-                else:
-                    cv2.imshow("AIBox", im0) # original image only
-                #cv2.resizeWindow("AIBox", im0.shape[1]//2, im0.shape[0]//2) # for resizing
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                side_by_side = create_side_by_side(im0, depthmap, False) # original image & depth side-by-side
+                cv2.imshow("AIBox & Depth", side_by_side)
+
+                pressed_key = cv2.waitKey(1)
+
+                trial_end_time = time.time()
+
+                trial_info = self.experiment_trial_logic(trial_start_time, trial_end_time, pressed_key)
+                
+                if trial_info == "break":
+                    try:
+                        bracelet_controller.print_output_data()
+                        bracelet_controller.save_output_data()
+                    except ValueError:
+                        pass
                     break
 
             # Save results
@@ -447,86 +377,125 @@ class TaskController(AutoAssign):
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[0] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[0].write(im0)
-
+            
         # endregion
 
-    @smart_inference_mode()
-    def run(self):
+# endregion
 
-        # Experiment setup
-        if not self.manual_entry:
-            target_objs = self.target_objs
-            self.obj_index = 0
-            print(f'The experiment will be run automatically. The selected target objects, in sequence, are:\n{target_objs}')
+# region Main
+
+if __name__ == '__main__':
+
+    #check_requirements(requirements='../requirements.txt', exclude=('tensorboard', 'thop'))
+    
+    weights_obj = 'yolov5s.pt'  # Object model weights path
+    weights_hand = 'hand.pt' # Hands model weights path
+    weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
+    #depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
+                                      # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
+    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
+    mock_navigate = True # Navigate without the bracelet using only print commands
+    belt_controller = None
+
+    metric = True
+    weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
+
+    # EXPERIMENT CONTROLS
+
+    target_objs = ['bottle', 'potted plant', 'bottle', 'cup', 'apple']
+
+    participant = 1
+    output_path = str(parent_dir) + '/results/'
+
+    try:
+        with open(output_path + f"calibration_participant_{participant}.json") as file:
+            participant_vibration_intensities = json.load(file)
+        print('Calibration intensities loaded succesfully.')
+    except:
+        while True:
+            continue_with_baseline = input('Error while loading the calibration file. Do you want to continue with baseline intensity of 50 for each vibromotor? (y/n)')
+            if continue_with_baseline == 'y':
+                participant_vibration_intensities = {'bottom': 50,
+                                                     'top': 50,
+                                                     'left': 50,
+                                                     'right': 50,}
+                break
+            elif continue_with_baseline == 'n':
+                sys.exit()
+
+    #
+
+    print(f'\nLOADING CAMERA AND BRACELET')
+
+    # Check camera connection
+    try:
+        source = str(source)
+        print('Camera connection successful')
+    except:
+        print('Cannot access selected source. Aborting.')
+        sys.exit()
+
+    # Check bracelet connection
+    if not mock_navigate:
+        connection_check, belt_controller = controller.connect_belt()
+        if connection_check:
+            print('Bracelet connection successful.')
         else:
-            print('The experiment will be run manually. You will enter the desired target for each run yourself.')
+            print('Error connecting bracelet. Aborting.')
+            sys.exit()
 
-        horizontal_in, vertical_in = False, False
-        self.target_entered = False
-        #play_start()  # play welcome sound
+    try:
+        bracelet_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+                        weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
+                        weights_tracker=weights_tracker, # ROOT
+                        weights_depth_estimator=weights_depth_estimator,
+                        source=source,  # file/dir/URL/glob/screen/0(webcam) # ROOT
+                        iou_thres=0.45,  # NMS IOU threshold
+                        max_det=1000,  # maximum detections per image
+                        device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
+                        view_img=True,  # show results
+                        save_txt=False,  # save results to *.txtm)
+                        imgsz=(640, 640),  # inference size (height, width)
+                        conf_thres=0.7,  # confidence threshold
+                        save_conf=False,  # save confidences in --save-txt labels
+                        save_crop=False,  # save cropped prediction boxes
+                        nosave=True,  # do not save images/videos
+                        classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
+                        classes_hand=[0,1], 
+                        #class_hand_nav=[80,81],
+                        agnostic_nms=False,  # class-agnostic NMS
+                        augment=False,  # augmented inference
+                        visualize=False,  # visualize features
+                        update=False,  # update all models
+                        project='runs/detect',  # save results to project/name # ROOT
+                        name='video',  # save results to project/name
+                        exist_ok=False,  # existing project/name ok, do not increment
+                        line_thickness=3,  # bounding box thickness (pixels)
+                        hide_labels=False,  # hide labels
+                        hide_conf=False,  # hide confidences
+                        half=False,  # use FP16 half-precision inference
+                        dnn=False,  # use OpenCV DNN for ONNX inference
+                        vid_stride=1,  # video frame-rate stride_obj
+                        manual_entry=False, # True means you will control the exp manually versus the standard automatic running
+                        run_object_tracker=True,
+                        run_depth_estimator=True,
+                        mock_navigate=mock_navigate,
+                        belt_controller=belt_controller,
+                        tracker_max_age=10,
+                        tracker_n_init=5,
+                        target_objs=target_objs,
+                        output_data=[],
+                        output_path=output_path,
+                        participant=participant,
+                        participant_vibration_intensities=participant_vibration_intensities,
+                        metric=metric) # debugging
+        
+        bracelet_controller.run()
 
-        # Configure saving
-        source = self.source
-
-        save_img = not self.nosave and not source.endswith('.txt')  # save inference images
-        is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
-        is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
-        webcam = source.isnumeric() or source.endswith('.streams') or (is_url and not is_file)
-        screenshot = source.lower().startswith('screen')
-
-        if is_url and is_file:
-            source = check_file(source)  # download
-
-        save_dir = increment_path(Path(self.project) / self.name, exist_ok=self.exist_ok)  # increment run
-        if save_img:
-            (save_dir / 'labels' if self.save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-
-        # Load object detection models
-        self.load_object_detector()
-
-        # Load data stream
-        self.bs = 1  # batch_size
-        view_img = check_imshow(warn=True)
-        try:
-            #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
-            self.dataset = LoadStreams(source, img_size=640)
-        except AssertionError:
-            while True:
-                change_camera = input(f'Failed to open camera with index {source}. Do you want to continue with webcam? (Y/N)')
-                if change_camera == 'y':
-                    source = '0'
-                    #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
-                    self.dataset = LoadStreams(source, img_size=640)
-                    break
-                elif change_camera == 'n':
-                    exit()
-        self.bs = len(self.dataset)
-        vid_path, vid_writer = [None] * self.bs, [None] * self.bs
-
-        # Create combined label dictionary
-        index_add = len(self.names_obj)
-        labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
-        self.master_label = self.names_obj | labels_hand_adj
-
-        # Load tracker model
-        if self.run_object_tracker:
-            self.load_object_tracker(max_age=self.tracker_max_age, n_init=self.tracker_n_init) # the max_age of a track should depend on the average fps of the program (i.e. should be measured in time, not frames)
-        else:
-            print('SKIPPING OBJECT TRACKER INITIALIZATION')
-
-        # Load depth estimator
-        if self.run_depth_estimator:
-            self.load_depth_estimator()
-        else:
-            print('SKIPPING DEPTH ESTIMATOR INITIALIZATION')
-
-        # Warmup models
-        #self.warmup_model(self.model_obj)
-        self.warmup_model(self.model_hand)
-        if self.run_object_tracker:
-            self.warmup_model(self.tracker.model,'tracker')
-
-        # Start experiment loop
-        self.experiment_loop(save_dir, save_img, index_add, vid_path, vid_writer)
+    except KeyboardInterrupt:
+        controller.close_app(belt_controller)
+    
+    # In the end, kill everything
+    controller.close_app(belt_controller)
 
 # endregion
