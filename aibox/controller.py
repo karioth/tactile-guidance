@@ -17,7 +17,7 @@ file = Path(__file__).resolve()
 root = file.parents[0]
 sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
-sys.path.append(str(root) + '/MiDaS')
+sys.path.append(str(root) + '/midas')
 
 # Image processing
 import cv2
@@ -34,8 +34,8 @@ from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from midas.midas.model_loader import default_models, load_model
+from midas.run import create_side_by_side, process
 
 # Navigation
 from bracelet import navigate_hand, connect_belt
