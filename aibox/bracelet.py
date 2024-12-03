@@ -325,8 +325,6 @@ class BraceletController:
             if belt_controller and self.vibrate:
                 belt_controller.stop_vibration()
 
-        print(hand)
-
         # 1. Grasping
         if overlapping:
             self.searching = True
