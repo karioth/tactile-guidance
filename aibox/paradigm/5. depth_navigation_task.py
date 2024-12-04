@@ -60,9 +60,10 @@ from midas.midas.model_loader import default_models, load_model
 from midas.run import create_side_by_side, process
 
 # Navigation
-from bracelet import navigate_hand, connect_belt
+#from bracelet import navigate_hand, connect_belt
+from bracelet import BraceletController, connect_belt
 
-class DepthNavigationTaskController(controller.BraceletController):
+class DepthNavigationTaskController(controller.TaskController):
 
     def save_output_data(self):
 
@@ -79,10 +80,14 @@ class DepthNavigationTaskController(controller.BraceletController):
         # end trial
         if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
             trial_end_time = time.time()
+            print(f'Trial time: {trial_end_time - trial_start_time}')
             self.output_data.append(trial_end_time - trial_start_time)
             self.output_data.append(chr(pressed_key))
 
             self.classes_obj = self.orig_classes_obj
+            print(self.classes_obj)
+
+            self.bracelet_controller.frozen = False
             
             if pressed_key == ord('y'):
                 print("TRIAL SUCCESSFUL")
@@ -102,8 +107,11 @@ class DepthNavigationTaskController(controller.BraceletController):
             print("STARTING NEXT TRIAL")
             self.target_entered = False
             self.ready_for_next_trial = False
+            self.bracelet_controller.vibrate = True
         # end experiment
         elif pressed_key == ord('q'):
+            if self.belt_controller:
+                self.belt_controller.stop_vibration()
             return "break"
     
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
@@ -122,6 +130,8 @@ class DepthNavigationTaskController(controller.BraceletController):
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
         trial_start_time = -1 # placeholder initial value
         self.orig_classes_obj = self.classes_obj
+
+        grasped = False
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -231,9 +241,13 @@ class DepthNavigationTaskController(controller.BraceletController):
 
             # without tracking
             else:
-                outputs = np.array(preds)
+                outputs = np.array(preds.cpu())
                 outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder
                 outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf columns for alignment with tracker
+                outputs = [np.append(bb, -1) for bb in outputs]
+
+                for bb in outputs:
+                    bb[:4] = xyxy2xywh(bb[:4])
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -257,10 +271,15 @@ class DepthNavigationTaskController(controller.BraceletController):
             #    depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
 
             # Depth estimation (automatically skips revived bbs)
-            if self.run_depth_estimator:
+            if not self.run_depth_estimator:
+                depth_img = None
+
+            else:
+                #depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
                 if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
-                    depthmap, _ = self.depth_estimator.predict_depth(im0)
-                    outputs = controller.bbs_to_depth(im0, depthmap, outputs)
+                #if frame % 1 == 0: # for effiency we are only predicting depth every 10th frame
+                    depth_img, _ = self.depth_estimator.predict_depth(im0)
+                    outputs = controller.bbs_to_depth(im0, depth_img, outputs)
                 else:
 
                     # Update depth values from previous outputs
@@ -271,8 +290,6 @@ class DepthNavigationTaskController(controller.BraceletController):
                                 output[7] = match[0][7]
                             else:
                                 output[7] = -1
-            else:
-                depthmap = None
 
             # Set current tracking information as previous info
             prev_outputs = np.array(outputs)
@@ -314,12 +331,23 @@ class DepthNavigationTaskController(controller.BraceletController):
 
                 self.target_entered = True
                 self.classes_obj = [self.class_target_obj]
+                grasped = False
                 trial_start_time = time.time()
+                vibration_timer = None
 
 
             # Navigate the hand based on information from last frame and current frame detections
-            #grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, self.class_hand_nav, depth_img, self.participant_vibration_intensities, 'depth_navigation')
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depthmap, self.participant_vibration_intensities, self.metric)
+            if not grasped:
+                grasped, curr_target = self.bracelet_controller.navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depth_img, self.participant_vibration_intensities, self.metric)
+            else: # if grasping signal was sent stop navigation process and reset target
+                if vibration_timer is None:
+                    vibration_timer = time.time()
+                    grasped, curr_target = True, None
+                elif vibration_timer > 0:
+                    if time.time() - vibration_timer > 1.5:
+                        if self.belt_controller:
+                            self.belt_controller.stop_vibration()
+                        vibration_timer = -1
 
         # region visualization
             # Write results
@@ -342,7 +370,7 @@ class DepthNavigationTaskController(controller.BraceletController):
             im0 = annotator.result()
             if self.view_img:
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                side_by_side = create_side_by_side(im0, depthmap, False) # original image & depth side-by-side
+                side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
                 cv2.imshow("AIBox & Depth", side_by_side)
 
                 pressed_key = cv2.waitKey(1)
@@ -353,8 +381,8 @@ class DepthNavigationTaskController(controller.BraceletController):
                 
                 if trial_info == "break":
                     try:
-                        bracelet_controller.print_output_data()
-                        bracelet_controller.save_output_data()
+                        self.print_output_data()
+                        self.save_output_data()
                     except ValueError:
                         pass
                     break
@@ -396,6 +424,7 @@ if __name__ == '__main__':
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
     mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
+    run_object_tracker = False
 
     metric = True
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
@@ -445,7 +474,9 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
+        bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
+
+        task_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
                         weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
                         weights_tracker=weights_tracker, # ROOT
                         weights_depth_estimator=weights_depth_estimator,
@@ -477,7 +508,7 @@ if __name__ == '__main__':
                         dnn=False,  # use OpenCV DNN for ONNX inference
                         vid_stride=1,  # video frame-rate stride_obj
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
-                        run_object_tracker=True,
+                        run_object_tracker=run_object_tracker,
                         run_depth_estimator=True,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
@@ -488,9 +519,10 @@ if __name__ == '__main__':
                         output_path=output_path,
                         participant=participant,
                         participant_vibration_intensities=participant_vibration_intensities,
-                        metric=metric) # debugging
+                        metric=metric,
+                        bracelet_controller=bracelet_controller) # debugging
         
-        bracelet_controller.run()
+        task_controller.run()
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)

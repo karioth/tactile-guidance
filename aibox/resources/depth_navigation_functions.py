@@ -23,9 +23,10 @@ def map_obstacles(handBB, targetBB, depth_map, metric):
 
     # Object closer to camera relative to hand -> values are larger
     hand_depth = handBB[7]
+    print(f'hand depth: {hand_depth}')
 
     #obstacle_mask = depth_map < hand_depth # binary mask
-    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map < hand_depth
+    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map <= hand_depth
 
     # Mask hand BB
     #obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = True
@@ -73,7 +74,8 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
     
     # Prevent division by zero and determine step changes
     if steps == 0:
-        return depth_map[int(hand_y), int(hand_x)] < depth_threshold
+        return False
+        #return depth_map[int(hand_y), int(hand_x)] < depth_threshold
 
     x_increment = dx / steps
     y_increment = dy / steps
@@ -86,6 +88,7 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
         # Check bounds
         if 0 <= xi < depth_map.shape[1] and 0 <= yi < depth_map.shape[0]:
             if depth_map[yi, xi] < depth_threshold:
+            #if depth_map[yi, xi] >= depth_threshold:
                 return True  # Found an obstacle
         
         x += x_increment
@@ -104,7 +107,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     # Determine general direction of movement
     angle_radians = np.arctan2(yc_hand - yc_target, xc_target - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
-    print(f'Angle: {angle}')
+    #print(f'Angle: {angle}')
 
     if 90 < angle < 270:
         direction = 'left'
@@ -114,13 +117,33 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     # Find closest obstacle point in x axis which is at least as high as hand center
     roi_target_point = obstacle_map[:int(yc_hand),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
 
+    # Find corners of obstacles
+    dst = cv2.cornerHarris(roi_target_point, 2, 3, 0.04)
+    dst = cv2.dilate(dst, None)
+    
+    # Find the x-coordinates of the corners that are above a threshold
+    corner_indices = np.argwhere(dst > 0.01 * dst.max())
+    
+    #if corner_indices.size == 0:
+    #    return [None, None]  # Return None if no corners are found
+    if corner_indices.size == 0:
+        return targetBB[:2]
+
+    min_y = np.min(corner_indices[:, 0])
+    min_x = corner_indices[corner_indices[:, 0] == min_y, 1].min()
+    max_x = corner_indices[corner_indices[:, 0] == min_y, 1].max()
+
+    # Determine target point based on direction
+    target_point = [max_x, min_y] if direction == 'left' else [min_x, min_y]
+
+    '''
     # Find corners of obstacles (candidates for a target point)
     dst = cv2.cornerHarris(roi_target_point,2,3,0.04)
 
     #result is dilated for marking the corners, not important
     dst = cv2.dilate(dst,None)
     dst_np = np.array(dst)
-    print(np.max(dst_np))
+    #print(np.max(dst_np))
 
     # visualize
     #corners_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
@@ -146,6 +169,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
         target_point = [max_x, min_y]
     else: # target on the right
         target_point = [min_x, min_y]
+    '''
 
     """
     # find max x and min y point (most top-right or top-left corner)
@@ -218,7 +242,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
     angle_radians = np.arctan2(yc_hand - target_point[1], target_point[0] - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
-    print(f'New angle: {angle}')
+    #print(f'New angle: {angle}')
 
     #return [obstacle_x + int(min(xc_hand, xc_target)), obstacle_y]
     return target_point

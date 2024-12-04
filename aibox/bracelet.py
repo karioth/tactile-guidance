@@ -298,14 +298,27 @@ class BraceletController:
 
             # Navigation with depth map
             else:
+                timer = time.time()
                 obstacles_mask = map_obstacles(hand, target, depth_img, metric)
+                print(f'obstacles_mask: {time.time() - timer}')
+                print(obstacles_mask.min())
+                print(obstacles_mask.max())
+                timer = time.time()
                 obstacles_between_hand_and_target = check_obstacles_between_points(hand, target, obstacles_mask, 1)
+                print(f'obstacles_between_hand_and_target: {time.time() - timer}')
+                print(obstacles_between_hand_and_target)
 
                 if not obstacles_between_hand_and_target:
+                    timer = time.time()
                     right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, target, vibration_intensities, depth_img)
+                    print(f'get_intensity: {time.time() - timer}')
                 else:
+                    timer = time.time()
                     obstacle_target = find_obstacle_target_point(hand, target, obstacles_mask)
+                    print(f'find_obstacle_target_point: {time.time() - timer}')
+                    timer = time.time()
                     right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
+                    print(f'get_intensity: {time.time() - timer}')
 
             # Check whether the hand is overlapping the target and freeze targetBB size if necessary (to avoid BB shrinking on occlusion)
             frozenBB = [self.frozen_x, self.frozen_y, self.frozen_w, self.frozen_h]
