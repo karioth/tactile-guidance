@@ -6,8 +6,6 @@ This script is using code from the following sources:
 - https://github.com/zenjieli/Yolov5StrongSORT/blob/master/track.py, original: https://github.com/mikel-brostrom/yolo_tracking/commit/9fec03ddba453959f03ab59bffc36669ae2e932a
 """
 
-# region Setup
-
 # System
 import sys
 import os
@@ -18,7 +16,8 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
 sys.path.append(str(parent_dir) + '/yolov5')
 sys.path.append(str(parent_dir) + '/strongsort')
-sys.path.append(str(parent_dir) + '/MiDaS')
+sys.path.append(str(parent_dir) + '/midas')
+sys.path.append(str(parent_dir) + '/unidepth')
 
 os.chdir(parent_dir)
 
@@ -26,13 +25,8 @@ os.chdir(parent_dir)
 import controller
 
 # Utility
-import keyboard
 from playsound import playsound
 import threading
-
-# endregion
-
-# region Task
 
 import numpy as np
 import time
@@ -59,6 +53,7 @@ from ultralytics.utils.ops import non_max_suppression as nms
 # DE
 from midas.midas.model_loader import default_models, load_model
 from midas.run import create_side_by_side, process
+
 
 # Navigation
 #from bracelet import navigate_hand, connect_belt
@@ -126,7 +121,6 @@ class GraspingTaskController(controller.TaskController):
         curr_frames = None
         fpss = []
         outputs = []
-        prev_outputs = np.array([])
 
         self.ready_for_next_trial = True
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
@@ -165,7 +159,6 @@ class GraspingTaskController(controller.TaskController):
             # Non-maximal supression
             with self.dt[2]:
                 pred_target = non_max_suppression(pred_target, self.conf_thres, self.iou_thres, self.classes_obj, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
-                #pred_target = nms(pred_target, self.conf_thres, self.iou_thres, self.classes_obj, self.agnostic_nms, max_det=self.max_det)
                 pred_hand = non_max_suppression(pred_hand, self.conf_thres, self.iou_thres, self.classes_hand, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
 
             for hand in pred_hand[0]:
@@ -183,12 +176,7 @@ class GraspingTaskController(controller.TaskController):
             clss = torch.empty(0)
 
             # Process object detections
-            #print(pred_target[0])
-            #print(pred_hand[0])
-            #targets = torch.from_numpy(pred_target[0].orig_img)
-            #print(targets)
-            #preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)
-            preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)
+            preds = torch.cat((pred_target[0], pred_hand[0]), dim=0) # (x, y, x, y, conf, cls)
             if len(preds) > 0:
                 preds[:, :4] = scale_boxes(im.shape[2:], preds[:, :4], im0.shape).round()
                 xywhs = xyxy2xywh(preds[:, :4])
@@ -199,70 +187,24 @@ class GraspingTaskController(controller.TaskController):
             if self.run_object_tracker:
                 
                 # Update previous information
-                outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
+                outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # (x, y, x, y, track_id, cls, conf)
                 
+                # Kill tracks of old objects right upon starting the trial
                 if not self.ready_for_next_trial:
                     hand_index_list = [hand + index_add for hand in self.classes_hand]
                     outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
-                # Add depth placeholder to outputs
-                outputs = [np.append(bb, -1) for bb in outputs]
-                """
-                helper_list = []
-                for bb in outputs:
-                    bb = np.append(bb, -1)
-                    helper_list.append(bb)
-                outputs = helper_list
-                """
+            else: # without tracking
 
-                """
-                # Get previous tracking information
-                prev_track_ids = []
-                if prev_outputs.size > 0:
-                    prev_track_ids = prev_outputs[:, 4].tolist()
-                
-                # Get current tracking information
-                tracks = self.tracker.tracker.tracks
-                track_ids = []
-                if len(outputs) > 0:
-                    track_ids = np.array(outputs)[:, 4].tolist()
+                outputs = np.array(preds.cpu()) # (x, y, x, y, conf, cls)
+                outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder --> (x, y, x, y, track_id, conf, cls)
+                outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf to match the output of the tracker --> (x, y, x, y, track_id, cls, conf)
 
-                # Revive previous information if necessary (get KF prediction for missing detections)
-                tracker_ids = [track.track_id for track in tracks]
-                # if there are more tracks than detections
-                if 0 < len(prev_track_ids) > len(track_ids):
-                    diff_ids = list(set(prev_track_ids) - set(track_ids))
-                    for diff_id in diff_ids:
-                        revivable_track = next((track for track in tracks if track.track_id == diff_id), None)
-                        if revivable_track is not None and diff_id in tracker_ids and revivable_track.state == 2:
-                            bbox_pred = revivable_track.mean[:4]
-                            if 0 <= bbox_pred[2] <= 1:
-                                bbox_pred[2] = bbox_pred[2] * bbox_pred[3] # xyah to xywh (or similar, but aspect to w)
-                            bbox_pred = np.array(bbox_pred)
-                            bbox_pred_xyxy = xywh2xyxy(bbox_pred).tolist() # convert xywh to xyxy, so all tracks in outputs can be converted together back to xywh
-                            idx = np.where(prev_outputs[:, 4] == diff_id)[0]
-                            if idx.size > 0:
-                                prev_info = prev_outputs[idx[0], 4:].tolist()
-                                # potentially set manual values for detection confidence and depth here
-                                revived_detection = np.array(bbox_pred_xyxy + prev_info)
-                                if isinstance(outputs, np.ndarray):
-                                    outputs = outputs.tolist()
-                                outputs.append(revived_detection)
-                """
+            # Convert xyxy to xywh
+            outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
 
-                # Convert BBs to xywh
-                for bb in outputs:
-                    bb[:4] = xyxy2xywh(bb[:4])
-
-            # without tracking
-            else:
-                outputs = np.array(preds.cpu())
-                outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder
-                outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf columns for alignment with tracker
-                outputs = [np.append(bb, -1) for bb in outputs]
-
-                for bb in outputs:
-                    bb[:4] = xyxy2xywh(bb[:4])
+            # Add depth placeholder to outputs
+            outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -270,22 +212,11 @@ class GraspingTaskController(controller.TaskController):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                #print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    #print('High change between frames. Resetting predictions.')
                     outputs = []
-                #cv2.imshow('Diff',diff)
-                #cv2.waitKey(0)
 
             # Depth estimation (automatically skips revived bbs)
-            if not self.run_depth_estimator:
-                depth_img = None
-
-            else:
-                depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
-
-            # Set current tracking information as previous info
-            prev_outputs = np.array(outputs)
+            depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs) if self.run_depth_estimator else (None, outputs)
 
             # Get FPS
             end = time.perf_counter()
@@ -293,10 +224,6 @@ class GraspingTaskController(controller.TaskController):
             fps = 1 / runtime
             fpss.append(fps)
             prev_frames = curr_frames
-            
-        # endregion
-
-        # region main navigation
 
             # Get the target object class
             if not self.target_entered:
@@ -323,8 +250,7 @@ class GraspingTaskController(controller.TaskController):
                     #playsound(str(file))
 
                 self.target_entered = True
-                self.classes_obj = [self.class_target_obj]
-                print(self.classes_obj)
+                self.classes_obj = [self.class_target_obj] # only detect the target object --> filtering of detections (and therefore tracks)
                 grasped = False
                 trial_start_time = time.time()
                 vibration_timer = None
@@ -342,7 +268,8 @@ class GraspingTaskController(controller.TaskController):
                             self.belt_controller.stop_vibration()
                         vibration_timer = -1
 
-        # region visualization
+        # VISUALIZATIONS
+
             # Write results
             for *xywh, obj_id, cls, conf, depth in outputs:
                 id, cls = int(obj_id), int(cls)
@@ -353,7 +280,6 @@ class GraspingTaskController(controller.TaskController):
 
             # Target BB
             if curr_target is not None:
-                #print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:
@@ -401,26 +327,22 @@ class GraspingTaskController(controller.TaskController):
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[0] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[0].write(im0)
-            
-        # endregion
 
-# endregion
 
-# region Main
 
 if __name__ == '__main__':
 
-    #check_requirements(requirements='../requirements.txt', exclude=('tensorboard', 'thop'))
+    #check_requirements(requirements='../../requirements.txt', exclude=('tensorboard', 'thop'))
     
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
     depth_estimator = 'midas_v21_small_256' # depth estimator model type (weights are loaded automatically!), 
                                       # e.g.'midas_v21_small_256', ('dpt_levit_224', 'dpt_swin2_tiny_256',) 'dpt_large_384'
-    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
+    source = '0' # image/video path or camera source (0 = webcam, 1 = external, ...)
     mock_navigate = True # Navigate without the bracelet using only print commands
     belt_controller = None
-    run_object_tracker = False
+    run_object_tracker = True
     run_depth_estimator = False
 
     # EXPERIMENT CONTROLS
@@ -445,8 +367,6 @@ if __name__ == '__main__':
                 break
             elif continue_with_baseline == 'n':
                 sys.exit()
-
-    #
 
     print(f'\nLOADING CAMERA AND BRACELET')
 
@@ -523,4 +443,3 @@ if __name__ == '__main__':
     # In the end, kill everything
     controller.close_app(belt_controller)
 
-# endregion

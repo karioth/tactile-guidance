@@ -141,20 +141,14 @@ dmypy.json
 
 
 # Project specific directories and files
-aibox/resources/datasets/
-aibox/resources/old_code/Testing/
-aibox/resources/fruithands.csv
-aibox/resources/hands_fp_raw.csv
-aibox/resources/object_detector_idea.pdf
-aibox/example_gpu.sh
-aibox/UOS_HPC_Guide.md
+flobox/resources/
 flobox/experiment/analysis/Ramon/
 flobox/experiment/forms/
 flobox/experiment/plots/
 flobox/experiment/Abrechnung_VPgelder.pdf
 flobox/experiment/Data_Analysis.zip
-flobox/resources/Copenhagen/
-flobox/resources/OptiVisT_Retreat_Poster.pdf
-flobox/resources/OptiVisT_Workshop_Program.pdf
-flobox/resources/OptiVisT_Workshop_Timetable.pdf
-flobox/Powell2024-Helping_Blind_People_Grasp.pdf
+aibox/resources/
+aibox/midas/weights/
+aibox/example_gpu.sh
+aibox/UOS_HPC_Guide.md
+

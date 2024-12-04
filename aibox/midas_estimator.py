@@ -49,7 +49,7 @@ import time
 # Use the project file packages instead of the conda packages, i.e. add to system path for import
 file = Path(__file__).resolve()
 root = file.parents[0]
-modules = ['MiDaS']
+modules = ['midas']
 for m in modules:
     path = root / m
     if path.exists() and str(path) not in sys.path:
