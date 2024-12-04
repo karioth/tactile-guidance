@@ -4,7 +4,8 @@ from queue import PriorityQueue
 
 def map_obstacles(handBB, targetBB, depth_map, metric):
 
-    bbs_dilation = 5
+    bbs_dilation = 10
+    obstacles_dilation = 3
 
     # Get BB information
     hand_x, hand_y, hand_w, hand_h = handBB[:4]
@@ -26,7 +27,7 @@ def map_obstacles(handBB, targetBB, depth_map, metric):
     print(f'hand depth: {hand_depth}')
 
     #obstacle_mask = depth_map < hand_depth # binary mask
-    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map <= hand_depth
+    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map < hand_depth
 
     # Mask hand BB
     #obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = True
@@ -37,7 +38,7 @@ def map_obstacles(handBB, targetBB, depth_map, metric):
     obstacle_mask[target_top-bbs_dilation:target_bottom+bbs_dilation, target_left-bbs_dilation:target_right+bbs_dilation] = False
 
     # Dilate obstacles
-    expanded_obstacle_mask = cv2.dilate(obstacle_mask.astype(np.uint8), np.ones((5, 5), np.uint8))
+    expanded_obstacle_mask = cv2.dilate(obstacle_mask.astype(np.uint8), np.ones((obstacles_dilation, obstacles_dilation), np.uint8))
     #depth_map[expanded_obstacle_mask > 0] = hand_depth - 5
 
     mask_rgb = cv2.cvtColor(expanded_obstacle_mask.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
@@ -62,10 +63,29 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
     """
     
     # Get BB information
-    hand_x, hand_y = handBB[:2]
-    target_x, target_y = targetBB[:2]
+    #hand_x, hand_y = handBB[:2]
+    #target_x, target_y = targetBB[:2]
+    xc_hand, yc_hand = handBB[:2]
+    xc_target, yc_target = targetBB[:2]
 
-    # Compute the difference in x and y
+    # If hand and target are aligned either horizontally or vertically navigate normally - TO EXPAND
+    if xc_hand == xc_target or yc_hand == yc_target:
+        return False
+
+    roi_depth_map = depth_map[int(min(yc_hand, yc_target)):int(max(yc_hand, yc_target)),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
+
+    mask_rgb = cv2.cvtColor(roi_depth_map.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+    cv2.imshow("roi_depth_map", mask_rgb)
+    cv2.setWindowProperty("roi_depth_map", cv2.WND_PROP_TOPMOST, 1)
+    pressed_key = cv2.waitKey(1)
+
+    # Check if there is any value above the threshold
+    if np.any(roi_depth_map >= depth_threshold):
+        return True
+    else:
+        return False
+
+    '''# Compute the difference in x and y
     dx = hand_x - target_x
     dy = hand_y - target_y
     
@@ -87,14 +107,14 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
         
         # Check bounds
         if 0 <= xi < depth_map.shape[1] and 0 <= yi < depth_map.shape[0]:
-            if depth_map[yi, xi] < depth_threshold:
-            #if depth_map[yi, xi] >= depth_threshold:
+            #if depth_map[yi, xi] < depth_threshold:
+            if depth_map[yi, xi] >= depth_threshold:
                 return True  # Found an obstacle
         
         x += x_increment
         y += y_increment
     
-    return False  # No obstacles found
+    return False  # No obstacles found'''
 
 def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
@@ -115,7 +135,8 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
         direction = 'right'
 
     # Find closest obstacle point in x axis which is at least as high as hand center
-    roi_target_point = obstacle_map[:int(yc_hand),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
+    #roi_target_point = obstacle_map[:int(yc_hand),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
+    roi_target_point = obstacle_map[int(min(yc_hand, yc_target)):int(max(yc_hand, yc_target)),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
 
     # Find corners of obstacles
     dst = cv2.cornerHarris(roi_target_point, 2, 3, 0.04)
@@ -234,7 +255,10 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     '''
 
     roi_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    roi_rgb[target_point[0], target_point[1]]=[0,0,255]
+    try:
+        roi_rgb[target_point[0], target_point[1]]=[0,0,255]
+    except:
+        pass
     cv2.circle(roi_rgb, (target_point[0], target_point[1]), radius=5, color=(0, 0, 255), thickness=-1)
     cv2.imshow("ROI", roi_rgb)
     #cv2.setWindowProperty("ROI", cv2.WND_PROP_TOPMOST, 1)
