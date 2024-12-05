@@ -56,6 +56,8 @@ class BraceletController:
         self.vibrate = True
         self.is_inside = False
         self.is_touched = False
+        self.obstacle_target = None
+        self.roi_min_y = -1
 
 
     def choose_detection(self, bboxes, previous_bbox=None, hand=False, w=1920, h=1080):
@@ -305,7 +307,36 @@ class BraceletController:
             # Get varying vibration intensities depending on angle from hand to target
             # Navigation without depth map
             if depth_img is None:
-                right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, target, vibration_intensities)
+
+                if self.obstacle_target is not None and self.obstacle_target != target[:2]:
+                    if self.roi_min_y > 5:
+                        right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, self.obstacle_target, vibration_intensities, depth_img)
+                        #print(f'get_intensity: {time.time() - timer}')
+                    else:
+                        print('Move back!')
+                        self.searching = True
+
+                        if belt_controller and self.vibrate:
+                            belt_controller.stop_vibration()
+                            belt_controller.send_pulse_command(
+                                channel_index=1,
+                                orientation_type=BeltOrientationType.BINARY_MASK,
+                                orientation=0b101000,
+                                intensity=30,
+                                on_duration_ms=150,
+                                pulse_period=300,
+                                pulse_iterations=5,
+                                series_period=5000,
+                                series_iterations=1,
+                                timer_option=BeltVibrationTimerOption.RESET_TIMER,
+                                exclusive_channel=False,
+                                clear_other_channels=False
+                            )
+
+                        return False, None
+                    
+                else:
+                    right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, target, vibration_intensities)
 
             # Navigation with depth map
             else:
@@ -318,16 +349,41 @@ class BraceletController:
                 #print(obstacles_between_hand_and_target)
 
                 if not obstacles_between_hand_and_target:
+                    self.obstacle_target = None
                     #timer = time.time()
                     right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, target, vibration_intensities)
                     #print(f'get_intensity: {time.time() - timer}')
                 else:
                     #timer = time.time()
-                    obstacle_target = find_obstacle_target_point(hand, target, obstacles_mask)
+                    self.obstacle_target, self.roi_min_y = find_obstacle_target_point(hand, target, obstacles_mask)
                     #print(f'find_obstacle_target_point: {time.time() - timer}')
                     #timer = time.time()
-                    right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
-                    #print(f'get_intensity: {time.time() - timer}')
+                    if self.roi_min_y > 5:
+                        right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, self.obstacle_target, vibration_intensities, depth_img)
+                        #print(f'get_intensity: {time.time() - timer}')
+                    else:
+                        print('Move back!')
+                        self.searching = True
+
+                        if belt_controller and self.vibrate:
+                            belt_controller.stop_vibration()
+                            belt_controller.send_pulse_command(
+                                channel_index=1,
+                                orientation_type=BeltOrientationType.BINARY_MASK,
+                                orientation=0b101000,
+                                intensity=30,
+                                on_duration_ms=150,
+                                pulse_period=300,
+                                pulse_iterations=5,
+                                series_period=5000,
+                                series_iterations=1,
+                                timer_option=BeltVibrationTimerOption.RESET_TIMER,
+                                exclusive_channel=False,
+                                clear_other_channels=False
+                            )
+
+                        return False, None
+                        #right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, obstacle_target, vibration_intensities, depth_img)
 
             # Check whether the hand is overlapping the target and freeze targetBB size if necessary (to avoid BB shrinking on occlusion)
             frozenBB = [self.frozen_x, self.frozen_y, self.frozen_w, self.frozen_h]
@@ -340,7 +396,8 @@ class BraceletController:
                 frozen_target[:4] = frozenBB
 
             # Move backwards if there is obstacle between hand and target (only used with depth map)
-            if depth_int == -1:
+            '''if depth_int == -1:
+                print('Move back!')
                 self.searching = True
 
                 if belt_controller and self.vibrate:
@@ -349,7 +406,7 @@ class BraceletController:
                         channel_index=1,
                         orientation_type=BeltOrientationType.BINARY_MASK,
                         orientation=0b101000,
-                        intensity=abs(depth_int),
+                        intensity=50,
                         on_duration_ms=150,
                         pulse_period=500,
                         pulse_iterations=5,
@@ -361,7 +418,7 @@ class BraceletController:
                     )
 
                 print('MOVE BACK')
-                return overlapping, frozen_target
+                return overlapping, frozen_target'''
 
         elif hand is None:
             frozen_target = None
@@ -462,7 +519,7 @@ class BraceletController:
                     channel_index=0,
                     orientation_type=BeltOrientationType.ANGLE,
                     orientation=60,  # bottom motor
-                    intensity=max(vibration_intensities.values()) // 6,
+                    intensity=max(vibration_intensities['bottom'], 20),
                     on_duration_ms=150,
                     pulse_period=500,
                     pulse_iterations=5,

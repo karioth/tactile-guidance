@@ -55,7 +55,7 @@ if __name__ == '__main__':
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
     source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
+    mock_navigate = False # Navigate without the bracelet using only print commands
     belt_controller = None
     run_object_tracker = True
     run_depth_estimator = False
@@ -65,7 +65,7 @@ if __name__ == '__main__':
 
     # EXPERIMENT CONTROLS
 
-    target_objs = ['bottle', 'clock', 'potted plant'] * 3
+    target_objs = ['bottle'] * 9
 
     participant = 1
     output_path = str(parent_dir) + '/results/'

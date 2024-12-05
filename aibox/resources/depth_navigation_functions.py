@@ -78,10 +78,13 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
 
     roi_depth_map = depth_map[int(min(yc_hand, yc_target)):int(max(yc_hand, yc_target)),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
 
-    mask_rgb = cv2.cvtColor(roi_depth_map.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    cv2.imshow("roi_depth_map", mask_rgb)
-    cv2.setWindowProperty("roi_depth_map", cv2.WND_PROP_TOPMOST, 1)
-    pressed_key = cv2.waitKey(1)
+    try:
+        mask_rgb = cv2.cvtColor(roi_depth_map.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+        cv2.imshow("roi_depth_map", mask_rgb)
+        cv2.setWindowProperty("roi_depth_map", cv2.WND_PROP_TOPMOST, 1)
+        pressed_key = cv2.waitKey(1)
+    except:
+        pass
 
     # Check if there is any value above the threshold
     if np.any(roi_depth_map >= depth_threshold):
@@ -89,36 +92,6 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
     else:
         return False
 
-    '''# Compute the difference in x and y
-    dx = hand_x - target_x
-    dy = hand_y - target_y
-    
-    # Check for line direction
-    steps = int(max(abs(dx), abs(dy)))
-    
-    # Prevent division by zero and determine step changes
-    if steps == 0:
-        return False
-        #return depth_map[int(hand_y), int(hand_x)] < depth_threshold
-
-    x_increment = dx / steps
-    y_increment = dy / steps
-
-    x, y = hand_x, hand_y
-
-    for _ in range(steps + 1):
-        xi, yi = int(round(x)), int(round(y))
-        
-        # Check bounds
-        if 0 <= xi < depth_map.shape[1] and 0 <= yi < depth_map.shape[0]:
-            #if depth_map[yi, xi] < depth_threshold:
-            if depth_map[yi, xi] >= depth_threshold:
-                return True  # Found an obstacle
-        
-        x += x_increment
-        y += y_increment
-    
-    return False  # No obstacles found'''
 
 def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
@@ -142,6 +115,12 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     #roi_target_point = obstacle_map[:int(yc_hand),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
     roi_target_point = obstacle_map[int(min(yc_hand, yc_target)):int(max(yc_hand, yc_target)),int(min(xc_hand, xc_target)):int(max(xc_hand, xc_target))]
 
+    roi_min_y = np.min(np.argwhere(roi_target_point)[:, 0])
+    print(roi_min_y)
+
+    #if roi_min_y <= 5:
+    #    return targetBB[:2], roi_min_y
+
     # Find corners of obstacles
     dst = cv2.cornerHarris(roi_target_point, 2, 3, 0.04)
     dst = cv2.dilate(dst, None)
@@ -152,7 +131,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     #if corner_indices.size == 0:
     #    return [None, None]  # Return None if no corners are found
     if corner_indices.size == 0:
-        return targetBB[:2]
+        return targetBB[:2], roi_min_y
 
     min_y = np.min(corner_indices[:, 0])
     min_x = np.min(corner_indices[:, 1])
@@ -163,111 +142,7 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
     # Determine target point based on direction
     target_point = [max_x, min_y] if direction == 'left' else [min_x, min_y]
-
-    '''
-    # Find corners of obstacles (candidates for a target point)
-    dst = cv2.cornerHarris(roi_target_point,2,3,0.04)
-
-    #result is dilated for marking the corners, not important
-    dst = cv2.dilate(dst,None)
-    dst_np = np.array(dst)
-    #print(np.max(dst_np))
-
-    # visualize
-    #corners_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    #corners_rgb[dst>0.01*dst.max()]=[0,0,255]
-    #cv2.imshow('corners',corners_rgb)
-
-    # Iterate through candidates
-    min_y, min_x, max_x = -1, -1, -1
-    for i in range(dst.shape[0]):
-        for j in range(dst.shape[1]):
-            if dst[i, j] > 0:
-                if min_y == -1:
-                    min_y = i
-                if min_x == -1:
-                    min_x = j
-                elif min_x > -1 and min_x > j:
-                    min_x = j
-                elif max_x < j:
-                    max_x = j
-
-
-    if 90 < angle < 270: # target on the left
-        target_point = [max_x, min_y]
-    else: # target on the right
-        target_point = [min_x, min_y]
-    '''
-
-    """
-    # find max x and min y point (most top-right or top-left corner)
-    max_x, max_y = np.unravel_index(np.argmax(dst), dst.shape)
-    min_y = np.argmin(dst[max_x])
-    #corner = dst[np.argmax(dst[:,])[-1], np.argmax(dst[:])[0]]
-
-    # Threshold for an optimal value, it may vary depending on the image.
     roi_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    roi_rgb[target_point[0], target_point[1]]=[0,0,255]
-
-    cv2.imshow('ROI',roi_rgb)
-    """
-    
-    '''
-    min_values = np.min(roi_target_point, axis=1)
-    min_indices = np.argmin(roi_target_point, axis=1)
-
-    min_indices = []
-    max_indices = []
-
-    for i in range(roi_target_point.shape[0]):  # Iterate over rows
-        min_value = min_values[i]
-        # Get the indices of the maximum value in the current row
-        indices_for_min_value = np.where(roi_target_point[i, :] == min_value)[0]
-        
-        # Find the minimum index for the current maximum value
-        min_index = indices_for_min_value.min()
-        max_index = indices_for_min_value.max()
-        min_indices.append(min_index)
-        max_indices.append(max_index)
-
-    if direction == 'left': # moving from right side of the image
-        obstacle_x = max(max_indices)
-    else:
-        obstacle_x = min(min_indices)
-
-    print(f'Obstacle x within ROI: {obstacle_x}, within whole map {obstacle_x + int(min(xc_hand, xc_target))}')
-
-    # Repeat procedure for finding point in y axis for the same ROI
-
-    min_values = np.min(roi_target_point, axis=0)
-    min_indices = np.argmin(roi_target_point, axis=0)
-
-    min_indices = []
-    max_indices = []
-
-    for i in range(roi_target_point.shape[1]):  # Iterate over rows
-        min_value = min_values[i]
-        # Get the indices of the maximum value in the current row
-        indices_for_min_value = np.where(roi_target_point[:, i] == min_value)[0]
-        
-        # Find the minimum index for the current maximum value
-        min_index = indices_for_min_value.min()
-        max_index = indices_for_min_value.max()
-        min_indices.append(min_index)
-        max_indices.append(max_index)
-
-    obstacle_y = min(min_indices)
-
-    print(f'Obstacle y within ROI: {obstacle_y}, within whole map {obstacle_y}')
-    '''
-
-    roi_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
-    """
-    try:
-        roi_rgb[target_point[0], target_point[1]]=[0,0,255]
-    except:
-        pass
-    """
 
     for candidate in corner_indices:
         cv2.circle(roi_rgb, (candidate[1], candidate[0]), radius=1, color=(0, 255, 0), thickness=-1)
@@ -278,10 +153,8 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
     angle_radians = np.arctan2(yc_hand - target_point[1], target_point[0] - xc_hand) # inverted y-axis
     angle = np.degrees(angle_radians) % 360
-    #print(f'New angle: {angle}')
 
-    #return [obstacle_x + int(min(xc_hand, xc_target)), obstacle_y]
-    return target_point
+    return target_point, roi_min_y
 
 
 def astar(handBB, targetBB, depth_map, depth_threshold, stop_condition):
