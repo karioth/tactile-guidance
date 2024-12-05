@@ -16,7 +16,8 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
 sys.path.append(str(parent_dir) + '/yolov5')
 sys.path.append(str(parent_dir) + '/strongsort')
-sys.path.append(str(parent_dir) + '/MiDaS')
+sys.path.append(str(parent_dir) + '/midas')
+sys.path.append(str(parent_dir) + '/unidepth')
 
 os.chdir(parent_dir)
 

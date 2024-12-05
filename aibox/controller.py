@@ -369,19 +369,18 @@ class TaskController(AutoAssign):
 
             if not self.run_depth_estimator:
                 depth_img = None
-
             else:
-                #depth_img, outputs = controller.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
                 if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
-                #if frame % 1 == 0: # for effiency we are only predicting depth every 10th frame
                     depth_img, _ = self.depth_estimator.predict_depth(im0)
                     outputs = bbs_to_depth(im0, depth_img, outputs)
                 else:
-
                     # Update depth values from previous outputs
                     if prev_outputs.size > 0:
                         for output in outputs:
-                            match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            if output[4] != -1: # tracking ID
+                                match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            else: # class number
+                                match = prev_outputs[prev_outputs[:, 5] == output[5]]
                             if match.size > 0:
                                 output[7] = match[0][7]
                             else:

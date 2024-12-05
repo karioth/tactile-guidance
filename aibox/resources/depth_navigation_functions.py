@@ -24,10 +24,14 @@ def map_obstacles(handBB, targetBB, depth_map, metric):
 
     # Object closer to camera relative to hand -> values are larger
     hand_depth = handBB[7]
-    print(f'hand depth: {hand_depth}')
 
-    #obstacle_mask = depth_map < hand_depth # binary mask
-    obstacle_mask = depth_map < hand_depth - 300 if not metric else depth_map < hand_depth
+    # relative hand depth is actually disparity, i.e. 1/estimate
+    scale = 5000
+    hand_depth = scale / hand_depth if not metric else hand_depth
+    depth_map = scale / depth_map if not metric else depth_map
+
+    # Create binary obstacle mask
+    obstacle_mask = depth_map < hand_depth
 
     # Mask hand BB
     #obstacle_mask[hand_top-bbs_dilation:hand_bottom+bbs_dilation, hand_left-bbs_dilation:hand_right+bbs_dilation] = True
@@ -151,8 +155,11 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
         return targetBB[:2]
 
     min_y = np.min(corner_indices[:, 0])
-    min_x = corner_indices[corner_indices[:, 0] == min_y, 1].min()
-    max_x = corner_indices[corner_indices[:, 0] == min_y, 1].max()
+    min_x = np.min(corner_indices[:, 1])
+    max_x = np.max(corner_indices[:, 1])
+
+    #min_x = corner_indices[corner_indices[:, 0] == min_y, 1].min()
+    #max_x = corner_indices[corner_indices[:, 0] == min_y, 1].max()
 
     # Determine target point based on direction
     target_point = [max_x, min_y] if direction == 'left' else [min_x, min_y]
@@ -255,10 +262,15 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     '''
 
     roi_rgb = cv2.cvtColor(roi_target_point.astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+    """
     try:
         roi_rgb[target_point[0], target_point[1]]=[0,0,255]
     except:
         pass
+    """
+
+    for candidate in corner_indices:
+        cv2.circle(roi_rgb, (candidate[1], candidate[0]), radius=1, color=(0, 255, 0), thickness=-1)
     cv2.circle(roi_rgb, (target_point[0], target_point[1]), radius=5, color=(0, 0, 255), thickness=-1)
     cv2.imshow("ROI", roi_rgb)
     #cv2.setWindowProperty("ROI", cv2.WND_PROP_TOPMOST, 1)
