@@ -93,9 +93,7 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
         return False
 
 
-def find_obstacle_target_point(handBB, targetBB, obstacle_map):
-
-    leeway = 10
+def find_obstacle_target_point(handBB, targetBB, obstacle_map, leeway=10):
 
     xc_hand, yc_hand = handBB[:2]
     xc_target, yc_target = targetBB[:2]
