@@ -95,6 +95,8 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
 
 def find_obstacle_target_point(handBB, targetBB, obstacle_map):
 
+    leeway = 10
+
     xc_hand, yc_hand = handBB[:2]
     xc_target, yc_target = targetBB[:2]
 
@@ -133,9 +135,9 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map):
     if corner_indices.size == 0:
         return targetBB[:2], roi_min_y
 
-    min_y = np.min(corner_indices[:, 0])
-    min_x = np.min(corner_indices[:, 1])
-    max_x = np.max(corner_indices[:, 1])
+    min_y = np.min(corner_indices[:, 0]) + leeway
+    min_x = np.min(corner_indices[:, 1]) + leeway
+    max_x = np.max(corner_indices[:, 1]) + leeway
 
     #min_x = corner_indices[corner_indices[:, 0] == min_y, 1].min()
     #max_x = corner_indices[corner_indices[:, 0] == min_y, 1].max()
