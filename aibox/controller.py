@@ -55,14 +55,16 @@ def bbs_to_depth(image, depth=None, bbs=None):
     """
     Calculate the mean depth for bounding boxes (BBs) in an image.
 
-    Parameters:
-    image (numpy.ndarray): The input image.
-    depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
-    bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
+    Args:
+        image (numpy.ndarray): The input image.
+        depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
+        bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
                                     as a list of 8 values [x, y, w, h, ... , mean_depth]. Defaults to None.
+
     Returns:
-    numpy.ndarray: An array of bounding boxes with updated mean depth values.
+        numpy.ndarray: An array of bounding boxes with updated mean depth values.
                    If no bounding boxes are provided, returns None.
+
     Notes:
     - If a bounding box already has a mean depth value (indicated by the 8th value not being -1), 
       it will be left unchanged.
@@ -122,14 +124,12 @@ class TaskController(AutoAssign):
     def save_output_data(self):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-
         df.to_csv(self.output_path + f"controller_output_data_{self.participant}.csv")
 
 
     def print_output_data(self):
 
         df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-
         print(df)
 
 
@@ -202,6 +202,21 @@ class TaskController(AutoAssign):
             model.warmup()
 
     def get_depth(self, im0, frame, outputs, prev_outputs, frame_factor=10):
+        """
+        Estimate and update depth information for given frames.
+
+        Args:
+            im0 (numpy.ndarray): The current frame image.
+            frame (int): The current frame number.
+            outputs (numpy.ndarray): The current detection outputs.
+            prev_outputs (numpy.ndarray): The detection outputs from the previous frame.
+            frame_factor (int, optional): The interval for predicting depth. Defaults to 10.
+
+        Returns:
+            tuple: A tuple containing:
+                - depthmap (numpy.ndarray): The estimated depth map for the current frame.
+                - outputs (numpy.ndarray): The updated detection outputs with depth information.
+        """
 
         if frame % frame_factor == 0: # for efficiency we are only predicting depth every n-th frame
             depthmap, _ = self.depth_estimator.predict_depth(im0)
@@ -220,6 +235,22 @@ class TaskController(AutoAssign):
 
 
     def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
+        """
+        Handles the logic for each trial in the experiment based on the pressed key.
+
+        Args:
+            trial_start_time (float): The start time of the trial.
+            trial_end_time (float): The end time of the trial.
+            pressed_key (int): The key pressed by the user.
+
+        Returns:
+            str: "break" if the experiment should end, otherwise None.
+
+        Logic:
+        - Starts the next trial if 's' is pressed and the system is ready for the next trial.
+        - Ends the trial if 'y' or 'n' is pressed and the system is not ready for the next trial.
+        - Ends the experiment if 'q' is pressed.
+        """
 
         # end trial
         if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
@@ -260,6 +291,34 @@ class TaskController(AutoAssign):
 
 
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
+        """
+        Main loop for running the experiment, processing each frame of the live stream.
+
+        Args:
+            save_dir (Path): Directory to save the results.
+            save_img (bool): Flag to save images.
+            index_add (int): Index to add to class IDs for hand detection.
+            vid_path (list): List containing the path to the video file.
+            vid_writer (list): List containing the video writer object.
+
+        Returns:
+            None
+
+        This function performs the following steps:
+            1. Initializes variables for tracking and sets up initial conditions.
+            2. Iterates over each frame of the live stream.
+            3. Pre-processes the image for object and hand detection.
+            4. Performs object and hand detection using YOLO models.
+            5. Applies non-maximal suppression to filter detections.
+            6. Updates the tracker with current frame detections.
+            7. Processes object detections and generates tracker outputs.
+            8. Calculates the difference between current and previous frames to reset object detections if rapid movement occured.
+            9. Estimates depth for detected objects if depth estimation is enabled.
+            10. Handles experimenter input for selecting the target object.
+            11. Navigates the hand based on detections and tracking information.
+            12. Visualizes and saves the results, including bounding boxes and FPS.
+            13. Manages trial logic and handles trial start and end conditions.
+        """
 
         print(f'\nSTARTING MAIN LOOP')
 

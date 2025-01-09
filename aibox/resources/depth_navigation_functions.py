@@ -3,6 +3,20 @@ import numpy as np
 from queue import PriorityQueue
 
 def map_obstacles(handBB, targetBB, depth_map, metric):
+    """
+    Maps obstacles in a depth map relative to the positions of the hand and target bounding boxes.
+
+    Args:
+        handBB (tuple): A tuple containing the bounding box coordinates and depth information for the hand.
+                        Format: (x, y, width, height, ..., depth)
+        targetBB (tuple): A tuple containing the bounding box coordinates and depth information for the target.
+                          Format: (x, y, width, height, ..., depth)
+        depth_map (numpy.ndarray): A 2D array representing the depth map of the scene.
+        metric (bool): A boolean indicating whether the depth values are in metric units (True) or disparity (False).
+
+    Returns:
+        numpy.ndarray: A binary mask indicating the positions of obstacles in the depth map.
+    """
 
     bbs_dilation = 10
     obstacles_dilation = 3
@@ -56,14 +70,14 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
     """
     Check if there are any obstacles between two points in a depth map.
 
-    Parameters:
-    start (tuple): Starting point (x1, y1).
-    end (tuple): Ending point (x2, y2).
-    depth_map (np.array): 2D numpy array representing the depth map.
-    depth_threshold (float): Threshold below which the pixel is considered an obstacle.
+    Args:
+        start (tuple): Starting point (x1, y1).
+        end (tuple): Ending point (x2, y2).
+        depth_map (np.array): 2D numpy array representing the depth map.
+        depth_threshold (float): Threshold below which the pixel is considered an obstacle.
 
     Returns:
-    bool: True if an obstacle is found, False otherwise.
+        bool: True if an obstacle is found, False otherwise.
     """
     
     # Get BB information
@@ -94,6 +108,19 @@ def check_obstacles_between_points(handBB, targetBB, depth_map, depth_threshold)
 
 
 def find_obstacle_target_point(handBB, targetBB, obstacle_map, leeway=10):
+    """
+    Finds the target point to avoid obstacles based on the bounding boxes of the hand and the target, 
+    and the obstacle map.
+
+    Args:
+        handBB (tuple): A tuple containing the coordinates of the hand bounding box center (xc_hand, yc_hand).
+        targetBB (tuple): A tuple containing the coordinates of the target bounding box center (xc_target, yc_target).
+        obstacle_map (numpy.ndarray): A 2D array representing the obstacle map.
+        leeway (int, optional): A leeway value to adjust the target point. Default is 10.
+
+    Returns:
+        tuple: A tuple containing the coordinates of the target point (x, y) and the minimum y-coordinate of the region of interest.
+    """
 
     xc_hand, yc_hand = handBB[:2]
     xc_target, yc_target = targetBB[:2]
@@ -158,7 +185,19 @@ def find_obstacle_target_point(handBB, targetBB, obstacle_map, leeway=10):
 
 
 def astar(handBB, targetBB, depth_map, depth_threshold, stop_condition):
-    """A* pathfinding algorithm for continuous angles, stopping after finding x steps in the optimal trajectory."""
+    """
+    Perform A* pathfinding algorithm to navigate from hand bounding box to target bounding box on a depth map.
+    
+    Args:
+        handBB (tuple): Coordinates of the hand bounding box center (x, y).
+        targetBB (tuple): Coordinates of the target bounding box center (x, y).
+        depth_map (numpy.ndarray): 2D array representing the depth map.
+        depth_threshold (float): Minimum depth value to consider a cell traversable.
+        stop_condition (int): Maximum number of steps to include in the path.
+    
+    Returns:
+        list: List of tuples representing the path from start to goal.
+    """
 
     ANGLE_RESOLUTION = 45
 
@@ -210,7 +249,19 @@ def astar(handBB, targetBB, depth_map, depth_threshold, stop_condition):
     return path
 
 def dijkstra(handBB, targetBB, depth_map, depth_threshold, stop_condition):
-    """Dijkstra's pathfinding algorithm for continuous angles."""
+    """
+    Perform Dijkstra's algorithm to find the shortest path from the hand bounding box to the target bounding box on a depth map.
+    
+    Args:
+        handBB (tuple): A tuple (x, y, width, height) representing the bounding box of the hand.
+        targetBB (tuple): A tuple (x, y, width, height) representing the bounding box of the target.
+        depth_map (numpy.ndarray): A 2D array representing the depth map.
+        depth_threshold (float): The minimum depth value to consider a point as traversable.
+        stop_condition (int): The maximum number of steps to include in the returned path.
+
+    Returns:
+        list: A list of tuples representing the path from the hand to the target, truncated to the stop_condition length.
+    """
 
     ANGLE_RESOLUTION = 5
 
@@ -262,7 +313,21 @@ def dijkstra(handBB, targetBB, depth_map, depth_threshold, stop_condition):
     return path[:stop_condition]
 
 def fast_pathfinding(handBB, targetBB, depth_map, depth_threshold, x):
-    """Pathfinding algorithm that stops after finding the first x optimal steps."""
+    """
+    Perform fast pathfinding from a starting bounding box to a target bounding box on a depth map.
+
+    Args:
+        handBB (tuple): A tuple (xc_hand, yc_hand, width, height) representing the bounding box of the hand.
+        targetBB (tuple): A tuple (xc_target, yc_target, width, height) representing the bounding box of the target.
+        depth_map (np.ndarray): A 2D numpy array representing the depth map.
+        depth_threshold (float): The minimum depth value to consider a point as traversable.
+        x (int): The number of steps to return in the path.
+
+    Returns:
+        list: A list of tuples representing the path from the start to the goal, limited to the first x steps.
+              If the goal is not reached, an empty list is returned.
+    """
+    
 
     ANGLE_RESOLUTION = 5
 
@@ -320,7 +385,17 @@ def fast_pathfinding(handBB, targetBB, depth_map, depth_threshold, x):
 
 
 def smooth_path(path, step_size):
-    """Smooth the path by creating waypoints based on the desired step size."""
+    """
+    Smooths a given path by interpolating points based on a specified step size.
+
+    Args:
+        path (list of tuples): A list of (x, y) coordinates representing the path to be smoothed.
+        step_size (float): The maximum allowed distance between consecutive points in the smoothed path.
+        
+    Returns:
+        list of tuples: A list of (x, y) coordinates representing the smoothed path.
+    """
+    
     smoothed_path = []
 
     start = np.array(path[0])

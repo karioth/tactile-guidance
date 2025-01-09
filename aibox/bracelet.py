@@ -61,6 +61,19 @@ class BraceletController:
 
 
     def choose_detection(self, bboxes, previous_bbox=None, hand=False, w=1920, h=1080):
+        """
+        Choose the best bounding box detection based on confidence, tracking ID, and distance.
+
+        Args:
+            bboxes (list): List of bounding boxes, where each bbox is a list [x, y, w, h, id, cls, conf].
+            previous_bbox (list, optional): The previous bounding box [x, y, w, h, id, cls, conf]. Default is None.
+            hand (bool, optional): Flag indicating if the detection is for a hand. Default is False.
+            w (int, optional): Width of the image. Default is 1920.
+            h (int, optional): Height of the image. Default is 1080.
+
+        Returns:
+            list: The chosen bounding box [x, y, w, h, id, cls, conf] or None if no suitable candidate is found.
+        """
         # Hyperparameters
         track_id_weight = 1000
         exponential_weight = 2
@@ -106,11 +119,6 @@ class BraceletController:
             return bboxes[np.argmax(candidates)] if len(candidates) else None
 
 
-    def calibrate_intensity(self):
-        # to be implemented
-        return 50
-
-
     def get_bb_bounds(self, BB):
 
         BB_x, BB_y, BB_w, BB_h = BB[:4]
@@ -124,6 +132,18 @@ class BraceletController:
 
 
     def get_intensity(self, handBB, targetBB, vibration_intensities, depth_img = None):
+        """
+        Calculate the vibration intensities for a wearable device based on the relative position and depth of the hand and target bounding boxes.
+
+        Args:
+            handBB (list or tuple): Bounding box coordinates for the hand in the format [x_center, y_center, width, height, ...].
+            targetBB (list or tuple): Bounding box coordinates for the target in the format [x_center, y_center, width, height, ...].
+            vibration_intensities (dict): Dictionary containing the maximum vibration intensities for each direction (keys: "top", "bottom", "left", "right").
+            depth_img (numpy.ndarray, optional): Depth image used to calculate the depth intensity. Default is None.
+
+        Returns:
+            tuple: A tuple containing the calculated vibration intensities for the right, left, top, and bottom motors, and the depth intensity.
+        """
         # Calculate angle
         xc_hand, yc_hand = handBB[:2]
         xc_target, yc_target = targetBB[:2]
@@ -138,6 +158,7 @@ class BraceletController:
 
         max_bottom_intensity, max_top_intensity, max_left_intensity, max_right_intensity = vibration_intensities["bottom"], vibration_intensities["top"], vibration_intensities["left"], vibration_intensities["right"]
 
+        # Calculate motor intensities based on the angle
         # Octants
         if 0 <= angle < 45:
             right_intensity = max_right_intensity
@@ -178,7 +199,7 @@ class BraceletController:
 
 
         '''
-        # Calculate motor intensities based on the angle
+        # Quadrants
         if 0 <= angle < 90:
             right_intensity = (90 - angle) / 90 * max_right_intensity
             top_intensity = angle / 90 * max_top_intensity
@@ -193,14 +214,10 @@ class BraceletController:
             right_intensity = (angle - 270) / 90 * max_right_intensity
         '''
 
-        #if type(depth_img) != None:
-        #    return int(right_intensity), int(left_intensity), int(top_intensity), int(bottom_intensity), 50
-        #if type(depth_img) == None:
         return int(right_intensity), int(left_intensity), int(top_intensity), int(bottom_intensity), 50
 
         # front / back motor (depth), currently it is used for grasping signal until front motor is added
         # If there is an anything between hand and target that can be hit (depth smaller than depth of both target and image) - move backwards
-
         hand_right, hand_left, hand_top, hand_bottom = self.get_bb_bounds(handBB)
         target_right, target_left, target_top, target_bottom = self.get_bb_bounds(targetBB)
 
@@ -234,6 +251,23 @@ class BraceletController:
 
 
     def check_overlap(self, handBB, targetBB, frozen=False):
+        """
+        Check if the bounding box (BB) of the hand overlaps with the target bounding box.
+
+        Args:
+            handBB (tuple): A tuple containing the x, y coordinates, width, and height of the hand bounding box.
+            targetBB (tuple): A tuple containing the x, y coordinates, width, and height of the target bounding box.
+            frozen (bool, optional): A flag indicating whether the target bounding box size should remain frozen. Defaults to False.
+
+        Returns:
+            tuple: A tuple containing:
+                - bool: True if the center of the hand is inside the target bounding box, otherwise False.
+                - int: The x coordinate of the target bounding box.
+                - int: The y coordinate of the target bounding box.
+                - int: The width of the target bounding box.
+                - int: The height of the target bounding box.
+                - bool: The updated frozen flag indicating whether the target bounding box size should remain frozen.
+        """
         # Get BB information
         hand_x, hand_y, hand_w, hand_h = handBB[:4]
         target_x, target_y, target_w, target_h = targetBB[:4]
@@ -272,20 +306,21 @@ class BraceletController:
 
 
     def navigate_hand(self, belt_controller, bboxes, target_cls: str, hand_clss: list, depth_img, vibration_intensities=None, metric=False):
-        """ Function that navigates the hand to the target object. Handles cases when either hand or target is not detected.
+        """ 
+        Function that navigates the hand to the target object. Handles cases when either hand or target is not detected.
 
         Args:
-        - belt_controller -- belt controller object
-        - bboxes -- object detections in current frame
-        - target_cls -- the target object ID
-        - hand_clss -- list of hand IDs
-        - depth_img -- depth map of the currently processed frame
-        - vibration_intensities -- intensitites of vibrations for each separate bracelet motor (range: 0 - 100)#
-        - mode -- guiding algorithm selection, options: grasping, depth_navigation
+            belt_controller: belt controller object
+            bboxes: object detections in current frame
+            target_cls: the target object ID
+            hand_clss: list of hand IDs
+            depth_img: depth map of the currently processed frame
+            vibration_intensities: intensitites of vibrations for each separate bracelet motor (range: 0 - 100)#
+            mode: guiding algorithm selection, options: grasping, depth_navigation
 
         Returns:
-        - overlapping -- information whether hand and target BBs are overlapping
-        - frozen_target -- frozen target BB (updated up until occlusion of hand and target occurs)
+            overlapping: information whether hand and target BBs are overlapping
+            frozen_target: frozen target BB (updated up until occlusion of hand and target occurs)
         """
         if vibration_intensities is None:
             vibration_intensities = self.vibration_intensities
@@ -396,7 +431,8 @@ class BraceletController:
                 frozen_target[:4] = frozenBB
 
             # Move backwards if there is obstacle between hand and target (only used with depth map)
-            '''if depth_int == -1:
+            '''
+            if depth_int == -1:
                 print('Move back!')
                 self.searching = True
 
@@ -418,7 +454,8 @@ class BraceletController:
                     )
 
                 print('MOVE BACK')
-                return overlapping, frozen_target'''
+                return overlapping, frozen_target
+            '''
 
         elif hand is None:
             frozen_target = None
