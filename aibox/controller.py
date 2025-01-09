@@ -1,23 +1,21 @@
-# region Setup
-
 # System
-import os
-import platform
 import sys
 from pathlib import Path
-import itertools
-import time
-import numpy as np
-import requests
-from playsound import playsound
-import threading
 
 # Use the project file packages instead of the conda packages, i.e. add to system path for import
 file = Path(__file__).resolve()
 root = file.parents[0]
 sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
-sys.path.append(str(root) + '/MiDaS')
+sys.path.append(str(root) + '/unidepth')
+sys.path.append(str(root) + '/midas')
+
+# Utility
+import time
+import pandas as pd
+import numpy as np
+from playsound import playsound
+import threading
 
 # Image processing
 import cv2
@@ -32,17 +30,16 @@ from yolov5.utils.general import (LOGGER, Profile, check_file, check_img_size, c
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from yolov5.utils.torch_utils import select_device, smart_inference_mode
 from strongsort.strong_sort import StrongSORT # there is also a pip install, but it has multiple errors
+from ultralytics import YOLO
+from ultralytics.nn.autobackend import AutoBackend
 
 # DE
-from MiDaS.midas.model_loader import default_models, load_model
-from MiDaS.run import create_side_by_side, process
+from unidepth_estimator import UniDepthEstimator # metric
+from midas_estimator import MidasDepthEstimator # relative
+from midas.run import create_side_by_side
 
 # Navigation
-from bracelet import navigate_hand, connect_belt
-
-# endregion
-
-# region Helpers
+from bracelet import BraceletController, connect_belt
 
 def playstart():
     file = 'resources/sound/beginning.mp3' # ROOT
@@ -54,56 +51,27 @@ def play_start():
     play_start_thread.start()
 
 
-def get_midas_weights(model_type):
-
-    path = f'./MiDaS/weights/{model_type}.pt'
-
-    # Download weights if not available
-    if not os.path.exists(path):
-        print("File does not exist. Downloading weights...")
-
-        # Get version from model type
-        if 'v21' in model_type:
-            version = 'v2_1'
-        elif model_type == 'dpt_large_384' or model_type == 'dpt_hybrid_384':
-            version = 'v3'
-        else:
-            print('Fallback to latest version V3.1 (May 2024).')
-            version = 'v3_1'
-        
-        # Create and download from URL
-        url = f'https://github.com/isl-org/MiDaS/releases/download/{version}/{model_type}.pt'
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(path, 'wb') as file:
-                file.write(response.content)
-            print("Weights downloaded successfully!")
-        else:
-            print("Failed to download weights file. Status code:", response.status_code)
-    else:
-        print("Weights already exists!")
-
-    weights = f'./MiDaS/weights/{model_type}.pt'
-
-    return weights
-
-
-def get_depth(image, transform, device, model, model_type, net_w, net_h, vis=False, sides=False, bbs=None):
+def bbs_to_depth(image, depth=None, bbs=None):
     """
-    Depth Estimation with MiDaS.
+    Calculate the mean depth for bounding boxes (BBs) in an image.
+
+    Args:
+        image (numpy.ndarray): The input image.
+        depth (numpy.ndarray, optional): The depth map corresponding to the input image. Defaults to None.
+        bbs (list of lists, optional): A list of bounding boxes, where each bounding box is represented 
+                                    as a list of 8 values [x, y, w, h, ... , mean_depth]. Defaults to None.
+
+    Returns:
+        numpy.ndarray: An array of bounding boxes with updated mean depth values.
+                   If no bounding boxes are provided, returns None.
+
+    Notes:
+    - If a bounding box already has a mean depth value (indicated by the 8th value not being -1), 
+      it will be left unchanged.
+    - The mean depth is calculated for the region of interest (ROI) defined by the bounding box 
+      in the depth map.
+    - If no bounding boxes are provided, a message will be printed and None will be returned.
     """
-    if image.max() > 1:
-        img = np.flip(image, 2)  # in [0, 255] (flip required to get RGB)
-        img = img/255
-    img_resized = transform({"image": img})["image"]
-
-    depth = process(device, model, model_type, img_resized, (net_w, net_h),
-                            image.shape[1::-1], False, True) # webcam: (720,1280)
-
-    if vis:
-        original_image_bgr = np.flip(image, 2) if sides else None
-        content = create_side_by_side(original_image_bgr, depth, False)
-        cv2.imshow('MiDaS Depth Estimation', content/255)
 
     if bbs is not None:
         outputs = []
@@ -114,18 +82,20 @@ def get_depth(image, transform, device, model, model_type, net_w, net_h, vis=Fal
                 y2 = y+(h//2)
                 roi = depth[y:y2, x:x2]
                 mean_depth = np.mean(roi)
-                median_depth = np.median(roi)
-                #print(f'Mean depth: {mean_depth}, Median depth: {median_depth}')
+                #median_depth = np.median(roi)
                 bb[7] = mean_depth
                 outputs.append(bb)
             else:
                 outputs.append(bb)
-
-    return depth, np.array(outputs)
+        return np.array(outputs)
+    else:
+        print('There are no BBs to calculate the depth for.')
+        return None
 
 
 def close_app(controller):
     print("Application will be closed")
+    controller.stop_vibration() if controller else None
     cv2.destroyAllWindows()
     # As far as I understood, all threads are properly closed by releasing their locks before being stopped
     threads = threading.enumerate()
@@ -135,9 +105,6 @@ def close_app(controller):
     controller.disconnect_belt() if controller else None
     sys.exit()
 
-# endregion
-
-# region BraceletController class
 
 class AutoAssign:
 
@@ -147,13 +114,24 @@ class AutoAssign:
             setattr(self, key, value)
 
 
-class BraceletController(AutoAssign):
+class TaskController(AutoAssign):
 
     def __init__(self, **kwargs):
         
         super().__init__(**kwargs)
 
-    # region models loaders
+    
+    def save_output_data(self):
+
+        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
+        df.to_csv(self.output_path + f"controller_output_data_{self.participant}.csv")
+
+
+    def print_output_data(self):
+
+        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
+        print(df)
+
 
     def load_object_detector(self):
         
@@ -161,11 +139,15 @@ class BraceletController(AutoAssign):
         
         self.device = select_device(self.device)
         self.model_obj = DetectMultiBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
+        #self.model_obj = AutoBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
+        #self.model_obj = YOLO(self.weights_obj, task='detect')
+        #self.model_obj.to('cuda')
         self.model_hand = DetectMultiBackend(self.weights_hand, device=self.device, dnn=self.dnn, fp16=self.half)
 
-        self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
+        self.names_obj = self.model_obj.names        
+        #self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
         self.stride_hand, self.names_hand, self.pt_hand = self.model_hand.stride, self.model_hand.names, self.model_hand.pt
-        self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
+        #self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
         self.dt = (Profile(), Profile(), Profile())
 
         print(f'\nOBJECT DETECTORS LOADED SUCCESFULLY')
@@ -194,14 +176,16 @@ class BraceletController(AutoAssign):
     def load_depth_estimator(self):
         
         print(f'\nLOADING DEPTH ESTIMATOR')
-
-        self.weights_DE = get_midas_weights(self.depth_estimator)
-        self.model, self.transform, self.net_w, self.net_h = load_model(self.device,
-                                                                        self.weights_DE,
-                                                                        self.depth_estimator,
-                                                                        optimize=False,
-                                                                        height=640,
-                                                                        square=False)
+        if self.metric:
+            self.depth_estimator = UniDepthEstimator(
+                model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
+                device=self.device
+            )
+        else:
+            self.depth_estimator = MidasDepthEstimator(
+                model_type = self.weights_depth_estimator, # midas_v21_384, dpt_levit_224
+                device=self.device
+            )
 
         print(f'\nDEPTH ESTIMATOR LOADED SUCCESFULLY')
         
@@ -211,15 +195,130 @@ class BraceletController(AutoAssign):
         print(f'\nWARMING UP MODEL...')
 
         if type == 'detector':
-            model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
+            #model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
+            model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
         
         if type == 'tracker':
             model.warmup()
 
-    # endregion
+    def get_depth(self, im0, frame, outputs, prev_outputs, frame_factor=10):
+        """
+        Estimate and update depth information for given frames.
+
+        Args:
+            im0 (numpy.ndarray): The current frame image.
+            frame (int): The current frame number.
+            outputs (numpy.ndarray): The current detection outputs.
+            prev_outputs (numpy.ndarray): The detection outputs from the previous frame.
+            frame_factor (int, optional): The interval for predicting depth. Defaults to 10.
+
+        Returns:
+            tuple: A tuple containing:
+                - depthmap (numpy.ndarray): The estimated depth map for the current frame.
+                - outputs (numpy.ndarray): The updated detection outputs with depth information.
+        """
+
+        if frame % frame_factor == 0: # for efficiency we are only predicting depth every n-th frame
+            depthmap, _ = self.depth_estimator.predict_depth(im0)
+            outputs = bbs_to_depth(im0, depthmap, outputs)
+        
+        else: # Update depth values from previous outputs
+            if prev_outputs.size > 0:
+                for output in outputs:
+                    match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                    if match.size > 0:
+                        output[7] = match[0][7]
+                    else:
+                        output[7] = -1
+
+        return depthmap, outputs
+
+
+    def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
+        """
+        Handles the logic for each trial in the experiment based on the pressed key.
+
+        Args:
+            trial_start_time (float): The start time of the trial.
+            trial_end_time (float): The end time of the trial.
+            pressed_key (int): The key pressed by the user.
+
+        Returns:
+            str: "break" if the experiment should end, otherwise None.
+
+        Logic:
+        - Starts the next trial if 's' is pressed and the system is ready for the next trial.
+        - Ends the trial if 'y' or 'n' is pressed and the system is not ready for the next trial.
+        - Ends the experiment if 'q' is pressed.
+        """
+
+        # end trial
+        if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
+            trial_end_time = time.time()
+            print(f'Trial time: {trial_end_time - trial_start_time}')
+            self.output_data.append(trial_end_time - trial_start_time)
+            self.output_data.append(chr(pressed_key))
+
+            self.classes_obj = self.orig_classes_obj
+            print(self.classes_obj)
+
+            self.bracelet_controller.frozen = False
+            
+            if pressed_key == ord('y'):
+                print("TRIAL SUCCESSFUL")
+            elif pressed_key == ord('n'):
+                print("TRIAL FAILED")
+            
+            if self.obj_index >= len(self.target_objs) - 1:
+                print("ALL TARGETS COVERED")
+                return "break"
+            else:
+                print("MOVING TO NEXT TARGET")
+                self.obj_index += 1
+                self.ready_for_next_trial = True
+                self.class_target_obj = -1
+        # start next trial
+        elif pressed_key == ord('s') and self.ready_for_next_trial:
+            print("STARTING NEXT TRIAL")
+            self.target_entered = False
+            self.ready_for_next_trial = False
+            self.bracelet_controller.vibrate = True
+        # end experiment
+        elif pressed_key == ord('q'):
+            if self.belt_controller:
+                self.belt_controller.stop_vibration()
+            return "break"
 
 
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
+        """
+        Main loop for running the experiment, processing each frame of the live stream.
+
+        Args:
+            save_dir (Path): Directory to save the results.
+            save_img (bool): Flag to save images.
+            index_add (int): Index to add to class IDs for hand detection.
+            vid_path (list): List containing the path to the video file.
+            vid_writer (list): List containing the video writer object.
+
+        Returns:
+            None
+
+        This function performs the following steps:
+            1. Initializes variables for tracking and sets up initial conditions.
+            2. Iterates over each frame of the live stream.
+            3. Pre-processes the image for object and hand detection.
+            4. Performs object and hand detection using YOLO models.
+            5. Applies non-maximal suppression to filter detections.
+            6. Updates the tracker with current frame detections.
+            7. Processes object detections and generates tracker outputs.
+            8. Calculates the difference between current and previous frames to reset object detections if rapid movement occured.
+            9. Estimates depth for detected objects if depth estimation is enabled.
+            10. Handles experimenter input for selecting the target object.
+            11. Navigates the hand based on detections and tracking information.
+            12. Visualizes and saves the results, including bounding boxes and FPS.
+            13. Manages trial logic and handles trial start and end conditions.
+        """
 
         print(f'\nSTARTING MAIN LOOP')
 
@@ -229,6 +328,14 @@ class BraceletController(AutoAssign):
         fpss = []
         outputs = []
         prev_outputs = np.array([])
+
+        self.ready_for_next_trial = True
+        self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
+        self.class_target_obj = -1 # placeholder value not assigned to any specific object
+        trial_start_time = -1 # placeholder initial value
+        self.orig_classes_obj = self.classes_obj
+
+        grasped = False
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -244,7 +351,8 @@ class BraceletController(AutoAssign):
             # Image pre-processing
             with self.dt[0]:
                 image = torch.from_numpy(im).to(self.model_obj.device)
-                image = image.half() if self.model_obj.fp16 else image.float()  # uint8 to fp16/32
+                #image = image.half() if self.model_obj.fp16 else image.float()  # uint8 to fp16/32
+                image = image.half() if self.model_hand.fp16 else image.float()
                 image /= 255  # 0 - 255 to 0.0 - 1.0
                 if len(image.shape) == 3:
                     image = image[None]  # expand for batch dim
@@ -252,7 +360,7 @@ class BraceletController(AutoAssign):
             # Object detection inference
             with self.dt[1]:
                 visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
-                pred_target = self.model_obj(image, augment=self.augment, visualize=visualize)
+                pred_target = self.model_obj(image, augment=self.augment, visualize=visualize) # YOLO11 runs nms by default
                 pred_hand = self.model_hand(image, augment=self.augment, visualize=visualize)
 
             # Non-maximal supression
@@ -275,7 +383,7 @@ class BraceletController(AutoAssign):
             clss = torch.empty(0)
 
             # Process object detections
-            preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)
+            preds = torch.cat((pred_target[0], pred_hand[0]), dim=0) # (x, y, x, y, conf, cls)
             if len(preds) > 0:
                 preds[:, :4] = scale_boxes(im.shape[2:], preds[:, :4], im0.shape).round()
                 xywhs = xyxy2xywh(preds[:, :4])
@@ -286,57 +394,24 @@ class BraceletController(AutoAssign):
             if self.run_object_tracker:
                 
                 # Update previous information
-                outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # takes xywhs, returns xyxys
-
-                # Add depth placeholder to outputs
-                helper_list = []
-                for bb in outputs:
-                    bb = np.append(bb, -1)
-                    helper_list.append(bb)
-                outputs = helper_list
-
-                # Get previous tracking information
-                prev_track_ids = []
-                if prev_outputs.size > 0:
-                    prev_track_ids = prev_outputs[:, 4].tolist()
+                outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # (x, y, x, y, track_id, cls, conf)
                 
-                # Get current tracking information
-                tracks = self.tracker.tracker.tracks
-                track_ids = []
-                if len(outputs) > 0:
-                    track_ids = np.array(outputs)[:, 4].tolist()
+                # Kill tracks of old objects right upon starting the trial
+                if not self.ready_for_next_trial:
+                    hand_index_list = [hand + index_add for hand in self.classes_hand]
+                    outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
-                # Revive previous information if necessary (get KF prediction for missing detections)
-                tracker_ids = [track.track_id for track in tracks]
-                # if there are more tracks than detections
-                if 0 < len(prev_track_ids) > len(track_ids):
-                    diff_ids = list(set(prev_track_ids) - set(track_ids))
-                    for diff_id in diff_ids:
-                        revivable_track = next((track for track in tracks if track.track_id == diff_id), None)
-                        if revivable_track is not None and diff_id in tracker_ids and revivable_track.state == 2:
-                            bbox_pred = revivable_track.mean[:4]
-                            if 0 <= bbox_pred[2] <= 1:
-                                bbox_pred[2] = bbox_pred[2] * bbox_pred[3] # xyah to xywh (or similar, but aspect to w)
-                            bbox_pred = np.array(bbox_pred)
-                            bbox_pred_xyxy = xywh2xyxy(bbox_pred).tolist() # convert xywh to xyxy, so all tracks in outputs can be converted together back to xywh
-                            idx = np.where(prev_outputs[:, 4] == diff_id)[0]
-                            if idx.size > 0:
-                                prev_info = prev_outputs[idx[0], 4:].tolist()
-                                # potentially set manual values for detection confidence and depth here
-                                revived_detection = np.array(bbox_pred_xyxy + prev_info)
-                                if isinstance(outputs, np.ndarray):
-                                    outputs = outputs.tolist()
-                                outputs.append(revived_detection)
+            else: # without tracking
 
-                # Convert BBs to xywh
-                for bb in outputs:
-                    bb[:4] = xyxy2xywh(bb[:4])
+                outputs = np.array(preds.cpu()) # (x, y, x, y, conf, cls)
+                outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder --> (x, y, x, y, track_id, conf, cls)
+                outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf to match the output of the tracker --> (x, y, x, y, track_id, cls, conf)
 
-            # without tracking
-            else:
-                outputs = np.array(preds)
-                outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder
-                outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf columns for alignment with tracker
+            # Convert xyxy to xywh
+            outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
+
+            # Add depth placeholder to outputs
+            outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -344,16 +419,31 @@ class BraceletController(AutoAssign):
                 diff = cv2.absdiff(img_gr_1, img_gr_2)
                 mean_diff = np.mean(diff)
                 std_diff = np.std(diff)
-                print(f'Frames mean difference: {mean_diff}, SD: {std_diff}')
                 if mean_diff > 30: # Big change between frames
-                    print('High change between frames. Resetting predictions.')
                     outputs = []
-                #cv2.imshow('Diff',diff)
-                #cv2.waitKey(0)    
-
 
             # Depth estimation (automatically skips revived bbs)
-            depth_img, outputs = get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs)
+            #depth_img, outputs = self.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs) if self.run_depth_estimator else (None, outputs)
+            #depth_img, outputs = self.get_depth(im0, frame, outputs, prev_outputs, 10) if self.run_depth_estimator else (None, outputs)
+
+            if not self.run_depth_estimator:
+                depth_img = None
+            else:
+                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
+                    depth_img, _ = self.depth_estimator.predict_depth(im0)
+                    outputs = bbs_to_depth(im0, depth_img, outputs)
+                else:
+                    # Update depth values from previous outputs
+                    if prev_outputs.size > 0:
+                        for output in outputs:
+                            if output[4] != -1: # tracking ID
+                                match = prev_outputs[prev_outputs[:, 4] == output[4]]
+                            else: # class number
+                                match = prev_outputs[prev_outputs[:, 5] == output[5]]
+                            if match.size > 0:
+                                output[7] = match[0][7]
+                            else:
+                                output[7] = -1
 
             # Set current tracking information as previous info
             prev_outputs = np.array(outputs)
@@ -364,10 +454,6 @@ class BraceletController(AutoAssign):
             fps = 1 / runtime
             fpss.append(fps)
             prev_frames = curr_frames
-            
-        # endregion
-
-        # region main navigation
 
             # Get the target object class
             if not self.target_entered:
@@ -380,7 +466,7 @@ class BraceletController(AutoAssign):
 
                         if target_obj_verb in coco_labels.values():
                             user_in = input("Selected object is " + target_obj_verb + ". Correct? [y,n]")
-                            class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
+                            self.class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
                             file = f'resources/sound/{target_obj_verb}.mp3'
                             #playsound(str(file))
                             # Start trial time measure (end in navigate_hand(...))
@@ -388,23 +474,32 @@ class BraceletController(AutoAssign):
                             print(f'The object {target_obj_verb} is not in the list of available targets. Please reselect.')
                 else:
                     target_obj_verb = self.target_objs[self.obj_index]
-                    class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
+                    self.class_target_obj = next(key for key, value in coco_labels.items() if value == target_obj_verb)
                     file = f'resources/sound/{target_obj_verb}.mp3'
+                    self.output_data.append(self.class_target_obj)
                     #playsound(str(file))
-                    # Start trial time measure (end in navigate_hand(...))
 
                 self.target_entered = True
+                self.classes_obj = [self.class_target_obj] # only detect the target object --> filtering of detections (and therefore tracks)
+                grasped = False
+                trial_start_time = time.time()
+                vibration_timer = None
 
             # Navigate the hand based on information from last frame and current frame detections
-            grasped, curr_target = navigate_hand(self.belt_controller, outputs, class_target_obj, self.class_hand_nav, depth_img)
-        
-            # Exit the loop if hand and object aligned horizontally and vertically and grasp signal was sent
-            if grasped:
-                if self.manual_entry and ((self.obj_index+1)<=len(self.target_objs)):
-                    self.obj_index += 1
-                self.target_entered = False
+            if not grasped:
+                grasped, curr_target = self.bracelet_controller.navigate_hand(self.belt_controller, outputs, self.class_target_obj, [hand + index_add for hand in self.classes_hand], depth_img, self.participant_vibration_intensities, self.metric)
+            else: # if grasping signal was sent stop navigation process and reset target
+                if vibration_timer is None:
+                    vibration_timer = time.time()
+                    grasped, curr_target = True, None
+                elif vibration_timer > 0:
+                    if time.time() - vibration_timer > 1.5:
+                        if self.belt_controller:
+                            self.belt_controller.stop_vibration()
+                        vibration_timer = -1
 
-        # region visualization
+        # VISUALIZATIONS
+
             # Write results
             for *xywh, obj_id, cls, conf, depth in outputs:
                 id, cls = int(obj_id), int(cls)
@@ -415,7 +510,6 @@ class BraceletController(AutoAssign):
 
             # Target BB
             if curr_target is not None:
-                print(curr_target)
                 for *xywh, obj_id, cls, conf, depth in [curr_target]:
                     xyxy = xywh2xyxy(np.array(xywh))
                     if save_img or self.save_crop or self.view_img:
@@ -425,13 +519,29 @@ class BraceletController(AutoAssign):
             # Display results
             im0 = annotator.result()
             if self.view_img:
-                #cv2.namedWindow("AIBox", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO) # for resizing
                 cv2.putText(im0, f'FPS: {int(fps)}, Avg: {int(np.mean(fpss))}', (20,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 1)
-                #cv2.imshow("AIBox", im0) # original image only
-                side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
-                cv2.imshow("AIBox & Depth", side_by_side)
-                #cv2.resizeWindow("AIBox", im0.shape[1]//2, im0.shape[0]//2) # for resizing
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                #side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
+                #cv2.imshow("AIBox & Depth", side_by_side)
+                if self.run_depth_estimator:
+                    side_by_side = create_side_by_side(im0, depth_img, False) # original image & depth side-by-side
+                    cv2.imshow("AIBox & Depth", side_by_side)
+
+                else:
+                    cv2.imshow("AIBox", im0)
+                    cv2.setWindowProperty("AIBox", cv2.WND_PROP_TOPMOST, 1)
+
+                pressed_key = cv2.waitKey(1)
+
+                trial_end_time = time.time()
+
+                trial_info = self.experiment_trial_logic(trial_start_time, trial_end_time, pressed_key)
+                
+                if trial_info == "break":
+                    try:
+                        self.print_output_data()
+                        self.save_output_data()
+                    except ValueError:
+                        pass
                     break
 
             # Save results
@@ -448,12 +558,11 @@ class BraceletController(AutoAssign):
                             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                            fps, w, h = 8, im0.shape[1], im0.shape[0] # int(np.mean(fpss))
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[0] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[0].write(im0)
 
-        # endregion
 
     @smart_inference_mode()
     def run(self):
@@ -493,15 +602,17 @@ class BraceletController(AutoAssign):
         self.bs = 1  # batch_size
         view_img = check_imshow(warn=True)
         try:
-            self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+            #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+            self.dataset = LoadStreams(source, img_size=640)
         except AssertionError:
             while True:
                 change_camera = input(f'Failed to open camera with index {source}. Do you want to continue with webcam? (Y/N)')
-                if change_camera == 'Y':
+                if change_camera == 'y':
                     source = '0'
-                    self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+                    #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
+                    self.dataset = LoadStreams(source, img_size=640)
                     break
-                elif change_camera == 'N':
+                elif change_camera == 'n':
                     exit()
         self.bs = len(self.dataset)
         vid_path, vid_writer = [None] * self.bs, [None] * self.bs
@@ -524,11 +635,10 @@ class BraceletController(AutoAssign):
             print('SKIPPING DEPTH ESTIMATOR INITIALIZATION')
 
         # Warmup models
-        self.warmup_model(self.model_obj)
+        #self.warmup_model(self.model_obj)
         self.warmup_model(self.model_hand)
-        self.warmup_model(self.tracker.model,'tracker')
+        if self.run_object_tracker:
+            self.warmup_model(self.tracker.model,'tracker')
 
         # Start experiment loop
         self.experiment_loop(save_dir, save_img, index_add, vid_path, vid_writer)
-
-# endregion
