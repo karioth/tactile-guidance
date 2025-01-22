@@ -1,35 +1,94 @@
-"""
-This script is using code from the following sources:
-- YOLOv5 🚀 by Ultralytics, AGPL-3.0 license, https://github.com/ultralytics/yolov5
-- StrongSORT MOT, https://github.com/dyhBUPT/StrongSORT, https://pypi.org/project/strongsort/
-- Youtube Tutorial "Simple YOLOv8 Object Detection & Tracking with StrongSORT & ByteTrack" by Nicolai Nielsen, https://www.youtube.com/watch?v=oDALtKbprHg
-- https://github.com/zenjieli/Yolov5StrongSORT/blob/master/track.py, original: https://github.com/mikel-brostrom/yolo_tracking/commit/9fec03ddba453959f03ab59bffc36669ae2e932a
-"""
-
-# region Setup
 import sys
-import controller
-# endregion
+import os
 
-# region Main
+# Use the project file packages instead of the conda packages, i.e. add to system path for import
+sys.path.append('/yolov5')
+sys.path.append('/strongsort')
+sys.path.append('/midas')
+sys.path.append('/unidepth')
+
+import argparse
+import json
+import controller
+from bracelet import connect_belt, BraceletController
+
 
 if __name__ == '__main__':
 
-    #check_requirements(requirements='../requirements.txt', exclude=('tensorboard', 'thop'))
+    # Parse arguments from CLI
+    parser = argparse.ArgumentParser(description="Argument parser for bracelet tasks.")
+
+    # Add arguments
+    parser.add_argument(
+        "-p", "--participant", 
+        type=int, 
+        required=True, 
+        help="Participant number (randomize manually before)."
+    )
+    parser.add_argument(
+        "-c", "--condition", 
+        type=str, 
+        required=True,
+        choices=['grasping', 'multiple_objects', 'depth_navigation'],
+        help="The task to be performed by the participant."
+    )
+    parser.add_argument(
+        "-m", "--metric", 
+        type=bool,
+        default=True, 
+        help="Whether metric or relative depth estimation should be used. Default: metric."
+    )
+    parser.add_argument(
+        "--mock_navigate", 
+        type=bool,
+        default=False, 
+        help="Whether to use mock navigation without a bracelet (for debugging)."
+    )
     
+    # Parse the arguments
+    args = parser.parse_args()
+    participant = args.participant
+    condition = args.condition
+    metric = args.metric
+    mock_navigate = args.mock_navigate
+    
+    # Parameters
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
 
-    run_object_tracker = True
+    run_object_tracker = True if condition == 'multiple_objects' else False
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
-    run_depth_estimator = True
-    metric = True
+    run_depth_estimator = True if condition == 'depth_navigation' else False
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
-    
-    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
+
+    source = '0' # image/video path or camera source (0 = webcam, 1 = external, ...)
     belt_controller = None
+
+    # Experiment controls
+    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
+    output_path = 'results/' + f'{condition}/'
+
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    try:
+        with open('results/calibration/' + f"calibration_participant_{participant}.json") as file:
+            participant_vibration_intensities = json.load(file)
+        print('Calibration intensities loaded succesfully.')
+
+    except:
+        while True:
+            continue_with_baseline = input('Error while loading the calibration file. Do you want to continue with baseline intensity of 50 for each vibromotor? (y/n)')
+            if continue_with_baseline == 'y':
+                participant_vibration_intensities = {'bottom': 50,
+                                                        'top': 50,
+                                                        'left': 50,
+                                                        'right': 50,}
+                break
+            elif continue_with_baseline == 'n':
+                print('Please try to re-import the calibration file. Aborting.')
+                sys.exit()
 
     print(f'\nLOADING CAMERA AND BRACELET')
 
@@ -43,7 +102,7 @@ if __name__ == '__main__':
 
     # Check bracelet connection
     if not mock_navigate:
-        connection_check, belt_controller = controller.connect_belt()
+        connection_check, belt_controller = connect_belt()
         if connection_check:
             print('Bracelet connection successful.')
         else:
@@ -51,8 +110,9 @@ if __name__ == '__main__':
             sys.exit()
 
     try:
-        bracelet_controller = controller.BraceletController(weights_obj=weights_obj,  # model_obj path or triton URL 
-                        weights_hand=weights_hand,  # model_obj path or triton URL 
+        bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
+        task_controller = controller.TaskController(weights_obj=weights_obj,  # model_obj path or triton URL
+                        weights_hand=weights_hand,  # model_obj path or triton URL
                         weights_tracker=weights_tracker,
                         weights_depth_estimator=weights_depth_estimator,
                         source=source,  # file/dir/URL/glob/screen/0(webcam)
@@ -66,14 +126,14 @@ if __name__ == '__main__':
                         save_conf=False,  # save confidences in --save-txt labels
                         save_crop=False,  # save cropped prediction boxes
                         nosave=True,  # do not save images/videos
-                        classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
+                        classes_obj=[1,39,40,41,42,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
-                        class_hand_nav=[80,81],
+                        #class_hand_nav=[80,81],
                         agnostic_nms=False,  # class-agnostic NMS
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features
                         update=False,  # update all models
-                        project='runs/detect',  # save results to project/name 
+                        project=output_path+'video/',  # save results to project/name
                         name='video',  # save results to project/name
                         exist_ok=False,  # existing project/name ok, do not increment
                         line_thickness=3,  # bounding box thickness (pixels)
@@ -85,19 +145,23 @@ if __name__ == '__main__':
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
                         run_object_tracker=run_object_tracker,
                         run_depth_estimator=run_depth_estimator,
-                        metric=metric,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
-                        tracker_max_age=10,
+                        tracker_max_age=60,
                         tracker_n_init=5,
-                        target_objs = ['bottle' for _ in range(5)]) # debugging
+                        target_objs=target_objs,
+                        output_data=[],
+                        output_path=output_path,
+                        condition=condition,
+                        participant=participant,
+                        participant_vibration_intensities=participant_vibration_intensities,
+                        bracelet_controller=bracelet_controller,
+                        metric=metric)
         
-        bracelet_controller.run()
+        task_controller.run()
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)
-    
-    # In the end, kill everything
-    controller.close_app(belt_controller)
 
-# endregion
+    # In the end, close all processes
+    controller.close_app(belt_controller)

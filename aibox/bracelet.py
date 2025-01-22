@@ -1,32 +1,29 @@
-# region Setup
-
-import time
+import numpy as np
 from pybelt.belt_controller import (BeltConnectionState, BeltController,
                                     BeltControllerDelegate, BeltMode,
                                     BeltOrientationType,
                                     BeltVibrationTimerOption, BeltVibrationPattern)
 from auto_connect import interactive_belt_connect, setup_logger
-import threading
-import sys
-from pynput.keyboard import Key, Listener
-import numpy as np
-from queue import PriorityQueue
-import cv2
-
-# Depth navigation functions
-
-from resources.depth_navigation_functions import map_obstacles, astar, smooth_path, check_obstacles_between_points, find_obstacle_target_point
+from resources.depth_navigation_functions import map_obstacles, check_obstacles_between_points, find_obstacle_target_point
 
 
-# endregion
+class Delegate(BeltControllerDelegate):
+    pass
 
 def connect_belt():
-    setup_logger()
+    """
+    This function initializes a logger, creates a belt controller delegate, and attempts to connect to the bracelet.
+    If the connection is successful, it sets the belt mode to APP mode.
 
+    Returns:
+        tuple: A tuple containing a boolean indicating the success of the connection and the belt controller instance.
+               (True, belt_controller) if the connection is successful,
+               (False, belt_controller) otherwise.
+    """
+
+    setup_logger()
     belt_controller_delegate = Delegate()
     belt_controller = BeltController(belt_controller_delegate)
-
-    # Interactive script to connect the belt
     interactive_belt_connect(belt_controller)
 
     if belt_controller.get_connection_state() != BeltConnectionState.CONNECTED:
@@ -37,15 +34,10 @@ def connect_belt():
         belt_controller.set_belt_mode(BeltMode.APP_MODE)
         return True, belt_controller
 
-class Delegate(BeltControllerDelegate):
-    # Belt controller delegate
-    pass
-
 
 class BraceletController:
 
     def __init__(self, vibration_intensities = {'bottom': 50, 'top': 50, 'left': 50, 'right': 50}):
-
         self.vibration_intensities = vibration_intensities
         self.searching = False
         self.prev_hand = None
@@ -78,18 +70,22 @@ class BraceletController:
         track_id_weight = 1000
         exponential_weight = 2
         distance_weight = 100
-
         candidates = []
+
         for bbox in bboxes:  # x, y, w, h, id, cls, conf
+
             # bbox has to be within image dimensions
             if bbox[0] <= w and bbox[1] <= h:
+
                 # confidence score
                 confidence = bbox[6]  # in [0,1]
                 confidence_score = exponential_weight**confidence - 1  # exponential growth in [0,1], could also use np.exp() and normalize
+
                 # tracking score
                 current_track_id = bbox[4]
                 previous_track_id = previous_bbox[4] if previous_bbox is not None else -1
                 track_id_score = track_id_weight if current_track_id == previous_track_id else 1  # 1|ꝏ
+
                 # distance score
                 if previous_bbox is None:
                     distance = None
@@ -108,6 +104,7 @@ class BraceletController:
                 # 100 -- different trackingID, matching BBs (max. 1px deviation), conf=1
                 # [0,1] -- different trackingID, BBs distance in [1., sqrt(w^2*h^2)], conf=1
                 candidates.append(score)
+
             else:
                 candidates.append(0)
 
@@ -127,7 +124,7 @@ class BraceletController:
         BB_left = BB_x - BB_w // 2
         BB_top = BB_y - BB_h // 2
         BB_bottom = BB_y + BB_h // 2
-
+        
         return BB_right, BB_left, BB_top, BB_bottom
 
 
@@ -196,7 +193,6 @@ class BraceletController:
         elif 315 < angle <= 360:
             bottom_intensity = (360 - angle) / 45 * max_bottom_intensity
             right_intensity = max_right_intensity
-
 
         '''
         # Quadrants
@@ -375,27 +371,16 @@ class BraceletController:
 
             # Navigation with depth map
             else:
-                #timer = time.time()
                 obstacles_mask = map_obstacles(hand, target, depth_img, metric)
-                #print(f'obstacles_mask: {time.time() - timer}')
-                #timer = time.time()
                 obstacles_between_hand_and_target = check_obstacles_between_points(hand, target, obstacles_mask, 1)
-                #print(f'obstacles_between_hand_and_target: {time.time() - timer}')
-                #print(obstacles_between_hand_and_target)
 
                 if not obstacles_between_hand_and_target:
                     self.obstacle_target = None
-                    #timer = time.time()
                     right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, target, vibration_intensities)
-                    #print(f'get_intensity: {time.time() - timer}')
                 else:
-                    #timer = time.time()
                     self.obstacle_target, self.roi_min_y = find_obstacle_target_point(hand, target, obstacles_mask)
-                    #print(f'find_obstacle_target_point: {time.time() - timer}')
-                    #timer = time.time()
                     if self.roi_min_y > 5:
                         right_int, left_int, top_int, bot_int, depth_int = self.get_intensity(hand, self.obstacle_target, vibration_intensities, depth_img)
-                        #print(f'get_intensity: {time.time() - timer}')
                     else:
                         print('Move back!')
                         self.searching = True
@@ -485,7 +470,6 @@ class BraceletController:
                     clear_other_channels=False
                 )
                 self.vibrate = False
-                print(f'Previous target: {self.prev_target}')
                 self.prev_target = None
                 frozen_target = None
             print("G R A S P !")

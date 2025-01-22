@@ -1,4 +1,11 @@
-# System
+"""
+This script is using code from the following sources:
+- YOLOv5 🚀 by Ultralytics, AGPL-3.0 license, https://github.com/ultralytics/yolov5
+- StrongSORT MOT, https://github.com/dyhBUPT/StrongSORT, https://pypi.org/project/strongsort/
+- Youtube Tutorial "Simple YOLOv8 Object Detection & Tracking with StrongSORT & ByteTrack" by Nicolai Nielsen, https://www.youtube.com/watch?v=oDALtKbprHg
+- https://github.com/zenjieli/Yolov5StrongSORT/blob/master/track.py, original: https://github.com/mikel-brostrom/yolo_tracking/commit/9fec03ddba453959f03ab59bffc36669ae2e932a
+"""
+
 import sys
 from pathlib import Path
 
@@ -14,8 +21,8 @@ sys.path.append(str(root) + '/midas')
 import time
 import pandas as pd
 import numpy as np
-from playsound import playsound
 import threading
+from playsound import playsound
 
 # Image processing
 import cv2
@@ -33,21 +40,18 @@ from strongsort.strong_sort import StrongSORT # there is also a pip install, but
 from ultralytics import YOLO
 from ultralytics.nn.autobackend import AutoBackend
 
-# DE
+# Depth Estimation
 from unidepth_estimator import UniDepthEstimator # metric
 from midas_estimator import MidasDepthEstimator # relative
 from midas.run import create_side_by_side
 
-# Navigation
-from bracelet import BraceletController, connect_belt
 
-def playstart():
-    file = 'resources/sound/beginning.mp3' # ROOT
+def beginning_sound():
+    file = 'resources/sound/beginning.mp3'
     playsound(str(file))
 
-
 def play_start():
-    play_start_thread = threading.Thread(target=playstart, name='play_start')
+    play_start_thread = threading.Thread(target=beginning_sound, name='play_start')
     play_start_thread.start()
 
 
@@ -75,7 +79,9 @@ def bbs_to_depth(image, depth=None, bbs=None):
 
     if bbs is not None:
         outputs = []
+
         for bb in bbs:
+
             if bb[7] == -1: # if already 8 values, depth has already been calculated (revived bb)
                 x,y,w,h = [int(coord) for coord in bb[:4]]
                 x2 = x+(w//2)
@@ -87,29 +93,40 @@ def bbs_to_depth(image, depth=None, bbs=None):
                 outputs.append(bb)
             else:
                 outputs.append(bb)
+
         return np.array(outputs)
+    
     else:
         print('There are no BBs to calculate the depth for.')
         return None
 
 
 def close_app(controller):
-    print("Application will be closed")
+    """
+    Closes the application by stopping the controller's vibration, destroying all OpenCV windows,
+    stopping all running threads, disconnecting the controller's belt, and exiting the program.
+
+    Args:
+        controller: An instance of the controller that manages the vibration and belt connection.
+                    If None, the function will skip the vibration stop and belt disconnection steps.
+    """
     controller.stop_vibration() if controller else None
     cv2.destroyAllWindows()
+
     # As far as I understood, all threads are properly closed by releasing their locks before being stopped
     threads = threading.enumerate()
     for thread in threads:
         thread._tstate_lock = None
         thread._stop()
+
     controller.disconnect_belt() if controller else None
+    print("Application will be closed.")
     sys.exit()
 
 
 class AutoAssign:
 
     def __init__(self, **kwargs):
-        
         for key, value in kwargs.items():
             setattr(self, key, value)
 
@@ -117,20 +134,20 @@ class AutoAssign:
 class TaskController(AutoAssign):
 
     def __init__(self, **kwargs):
-        
         super().__init__(**kwargs)
+        self.variables = ['object_class', 'trial_time', 'success']
 
     
     def save_output_data(self):
-
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-        df.to_csv(self.output_path + f"controller_output_data_{self.participant}.csv")
-
-
-    def print_output_data(self):
-
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
+        # Fill missing values with NA for reshaping
+        n = len(self.variables)
+        if len(self.output_data) % n != 0:
+            missing_data = (n - len(self.output_data) % n) * ['NA']
+            self.output_data.extend(missing_data)
+        
+        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//n, n), columns=self.variables)
         print(df)
+        df.to_csv(self.output_path + f"{self.condition}_participant_{self.participant}.csv")
 
 
     def load_object_detector(self):
@@ -156,7 +173,7 @@ class TaskController(AutoAssign):
     def load_object_tracker(self, max_age=70, n_init=3):
 
         print(f'\nLOADING OBJECT TRACKER')
-        
+
         self.tracker = StrongSORT(
                 model_weights=self.weights_tracker, 
                 device=self.device,
@@ -169,13 +186,14 @@ class TaskController(AutoAssign):
                 mc_lambda=0.995,       # matching with both appearance (1 - MC_LAMBDA) and motion cost
                 ema_alpha=0.9          # updates  appearance  state in  an exponential moving average manner
                 )
-        
+    
         print(f'\nOBJECT TRACKER LOADED SUCCESFULLY')
 
 
     def load_depth_estimator(self):
         
         print(f'\nLOADING DEPTH ESTIMATOR')
+
         if self.metric:
             self.depth_estimator = UniDepthEstimator(
                 model_type = self.weights_depth_estimator, # v2-vits14, v1-cnvnxtl
@@ -260,7 +278,6 @@ class TaskController(AutoAssign):
             self.output_data.append(chr(pressed_key))
 
             self.classes_obj = self.orig_classes_obj
-            print(self.classes_obj)
 
             self.bracelet_controller.frozen = False
             
@@ -271,20 +288,24 @@ class TaskController(AutoAssign):
             
             if self.obj_index >= len(self.target_objs) - 1:
                 print("ALL TARGETS COVERED")
+                self.save_output_data()
                 return "break"
             else:
                 print("MOVING TO NEXT TARGET")
                 self.obj_index += 1
                 self.ready_for_next_trial = True
                 self.class_target_obj = -1
+
         # start next trial
         elif pressed_key == ord('s') and self.ready_for_next_trial:
             print("STARTING NEXT TRIAL")
             self.target_entered = False
             self.ready_for_next_trial = False
             self.bracelet_controller.vibrate = True
+
         # end experiment
-        elif pressed_key == ord('q'):
+        elif pressed_key == ord('c'): # 'q' interferes with opencv
+            self.save_output_data()
             if self.belt_controller:
                 self.belt_controller.stop_vibration()
             return "break"
@@ -498,7 +519,7 @@ class TaskController(AutoAssign):
                             self.belt_controller.stop_vibration()
                         vibration_timer = -1
 
-        # VISUALIZATIONS
+            # VISUALIZATIONS
 
             # Write results
             for *xywh, obj_id, cls, conf, depth in outputs:
@@ -537,11 +558,6 @@ class TaskController(AutoAssign):
                 trial_info = self.experiment_trial_logic(trial_start_time, trial_end_time, pressed_key)
                 
                 if trial_info == "break":
-                    try:
-                        self.print_output_data()
-                        self.save_output_data()
-                    except ValueError:
-                        pass
                     break
 
             # Save results
@@ -581,7 +597,6 @@ class TaskController(AutoAssign):
 
         # Configure saving
         source = self.source
-
         save_img = not self.nosave and not source.endswith('.txt')  # save inference images
         is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
         is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
@@ -601,12 +616,14 @@ class TaskController(AutoAssign):
         # Load data stream
         self.bs = 1  # batch_size
         view_img = check_imshow(warn=True)
+
         try:
             #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
             self.dataset = LoadStreams(source, img_size=640)
+
         except AssertionError:
             while True:
-                change_camera = input(f'Failed to open camera with index {source}. Do you want to continue with webcam? (Y/N)')
+                change_camera = input(f'Failed to open camera with index {source}. Do you want to continue with webcam? (y/n)')
                 if change_camera == 'y':
                     source = '0'
                     #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
@@ -614,6 +631,7 @@ class TaskController(AutoAssign):
                     break
                 elif change_camera == 'n':
                     exit()
+
         self.bs = len(self.dataset)
         vid_path, vid_writer = [None] * self.bs, [None] * self.bs
 

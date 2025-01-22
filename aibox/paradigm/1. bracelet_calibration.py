@@ -1,4 +1,3 @@
-# System
 import sys
 import os
 
@@ -9,21 +8,30 @@ sys.path.append(parent_dir)
 import keyboard
 import time
 import json
-
 from pybelt.belt_controller import (BeltOrientationType, BeltVibrationPattern)
-
 from bracelet import connect_belt
 from controller import close_app
 
-def calibrate_intensity(direction):
-    
-    intensity = 5 # initial value
 
+def calibrate_intensity(direction):
+    """
+    Calibrates the vibration intensity of a belt based on user input.
+    This function sends continuous vibration commands to a belt controller
+    and allows the user to adjust the intensity [5,100] using keyboard inputs (+/-5).
+    The function runs in a loop until the experimenter confirms the calibration ('y').
+
+    Args:
+        direction (str): The direction for which the belt should vibrate.
+                     Must be one of 'bottom', 'top', 'left', or 'right'.
+    
+    Returns:
+        intensity: The final calibrated intensity value.
+    """
+    intensity = 5 # initial value
     orientation_mapping = {"bottom": 60,
                            "top": 90,
                            "left": 120,
                            "right": 45}
-    
     orientation = orientation_mapping[direction]
 
     while True:
@@ -49,15 +57,20 @@ def calibrate_intensity(direction):
             intensity -= 5
             time.sleep(0.1)
         elif keyboard.is_pressed('y'):
-            belt_controller.stop_vibration()
+            belt_controller.yystop_vibration()
             time.sleep(1)
             return intensity
+
 
 if __name__ == '__main__':
 
     participant = 1
-    output_path = str(parent_dir) + '/results/'
+    output_path = str(parent_dir) + '/results/calibration/'
 
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    
+    # Connect the bracelet
     connection_check, belt_controller = connect_belt()
     if connection_check:
         print('Bracelet connection successful.')
@@ -69,16 +82,18 @@ if __name__ == '__main__':
     output = {}
 
     try:
+        # Calibrate bracelet for each direction
         for motor_direction in directions:
             motor_intensity = calibrate_intensity(motor_direction)
             print(f"Direction: {motor_direction}, intensity: {motor_intensity}")
             output[motor_direction] = motor_intensity
 
+        # Save the calibration results after experimenter confirmation
         with open(output_path + f"calibration_participant_{participant}.json", "w") as json_file:
             json.dump(output, json_file)
 
     except KeyboardInterrupt:
         close_app(belt_controller)
     
-    # In the end, kill everything
+    # In the end, close all processes
     close_app(belt_controller)
