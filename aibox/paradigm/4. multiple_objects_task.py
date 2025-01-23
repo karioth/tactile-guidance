@@ -10,49 +10,40 @@ sys.path.append(str(parent_dir) + '/midas')
 sys.path.append(str(parent_dir) + '/unidepth')
 os.chdir(parent_dir)
 
-import numpy as np
-import pandas as pd
 import json
 import controller
 from bracelet import connect_belt, BraceletController
 
 
-class MultipleObjectsTaskController(controller.TaskController):
-
-    def save_output_data(self):
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-        df.to_csv(self.output_path + f"multiple_objects_task_participant_{self.participant}.csv")
-
-
 if __name__ == '__main__':
-    
+
     # Parameters
+    participant = '0'
+    condition = 'multiple_objects'
+    metric = True
+    mock_navigate = False
+    
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
 
-    run_object_tracker = True
+    run_object_tracker = True if condition == 'multiple_objects' else False
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
-    run_depth_estimator = False
-    metric = True
+    run_depth_estimator = True if condition == 'depth_navigation' else False
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
 
-    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = False # Navigate without the bracelet using only print commands
+    source = '0' # image/video path or camera source (0 = webcam, 1 = external, ...)
     belt_controller = None
 
     # Experiment controls
-    target_objs = ['bottle'] * 10
-    participant = 1
-    results = str(parent_dir) + '/results/'
-    condition = 'multiple_objects'
-    output_path = results + f'{condition}/'
+    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
+    output_path = 'results/' + f'{condition}/'
 
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
     try:
-        with open(results + 'calibration/' + f"calibration_participant_{participant}.json") as file:
+        with open('results/calibration/' + f"calibration_participant_{participant}.json") as file:
             participant_vibration_intensities = json.load(file)
         print('Calibration intensities loaded succesfully.')
 
@@ -61,9 +52,9 @@ if __name__ == '__main__':
             continue_with_baseline = input('Error while loading the calibration file. Do you want to continue with baseline intensity of 50 for each vibromotor? (y/n)')
             if continue_with_baseline == 'y':
                 participant_vibration_intensities = {'bottom': 50,
-                                                     'top': 50,
-                                                     'left': 50,
-                                                     'right': 50,}
+                                                        'top': 50,
+                                                        'left': 50,
+                                                        'right': 50,}
                 break
             elif continue_with_baseline == 'n':
                 print('Please try to re-import the calibration file. Aborting.')
@@ -90,11 +81,11 @@ if __name__ == '__main__':
 
     try:
         bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
-        task_controller = MultipleObjectsTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
-                        weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
-                        weights_tracker=weights_tracker, # ROOT
+        task_controller = controller.TaskController(weights_obj=weights_obj,  # model_obj path or triton URL
+                        weights_hand=weights_hand,  # model_obj path or triton URL
+                        weights_tracker=weights_tracker,
                         weights_depth_estimator=weights_depth_estimator,
-                        source=source,  # file/dir/URL/glob/screen/0(webcam) # ROOT
+                        source=source,  # file/dir/URL/glob/screen/0(webcam)
                         iou_thres=0.45,  # NMS IOU threshold
                         max_det=1000,  # maximum detections per image
                         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
@@ -112,7 +103,7 @@ if __name__ == '__main__':
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features
                         update=False,  # update all models
-                        project=output_path+'video/',  # save results to project/name # ROOT
+                        project=output_path+'video/',  # save results to project/name
                         name='video',  # save results to project/name
                         exist_ok=False,  # existing project/name ok, do not increment
                         line_thickness=3,  # bounding box thickness (pixels)
@@ -126,8 +117,8 @@ if __name__ == '__main__':
                         run_depth_estimator=run_depth_estimator,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
-                        tracker_max_age=10,
-                        tracker_n_init=3,
+                        tracker_max_age=60,
+                        tracker_n_init=5,
                         target_objs=target_objs,
                         output_data=[],
                         output_path=output_path,
@@ -135,12 +126,12 @@ if __name__ == '__main__':
                         participant=participant,
                         participant_vibration_intensities=participant_vibration_intensities,
                         bracelet_controller=bracelet_controller,
-                        metric=metric) # debugging
+                        metric=metric)
         
         task_controller.run()
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)
-    
+
     # In the end, close all processes
     controller.close_app(belt_controller)

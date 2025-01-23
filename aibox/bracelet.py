@@ -5,6 +5,7 @@ from pybelt.belt_controller import (BeltConnectionState, BeltController,
                                     BeltVibrationTimerOption, BeltVibrationPattern)
 from auto_connect import interactive_belt_connect, setup_logger
 from resources.depth_navigation_functions import map_obstacles, check_obstacles_between_points, find_obstacle_target_point
+import time
 
 
 class Delegate(BeltControllerDelegate):
@@ -50,6 +51,9 @@ class BraceletController:
         self.is_touched = False
         self.obstacle_target = None
         self.roi_min_y = -1
+        self.navigation_time = 'NA'
+        self.freezing_time = 'NA'
+        self.grasping_time = 'NA'
 
 
     def choose_detection(self, bboxes, previous_bbox=None, hand=False, w=1920, h=1080):
@@ -94,7 +98,7 @@ class BraceletController:
                     current_location = bbox[:2]
                     previous_location = previous_bbox[:2]
                     distance = np.linalg.norm(current_location - previous_location)
-                    distance_inverted = 1 / distance if distance >= 1 else distance_weight
+                    distance_inverted = 1 / distance if distance >= 100 else distance_weight
 
                 # total score
                 score = track_id_score * confidence_score * distance_inverted
@@ -335,6 +339,10 @@ class BraceletController:
         self.prev_target = target
 
         if hand is not None and target is not None:
+
+            # Save navigation start timestamp
+            if self.navigation_time is None:
+                self.navigation_time = time.time()
             # Get varying vibration intensities depending on angle from hand to target
             # Navigation without depth map
             if depth_img is None:
@@ -412,6 +420,7 @@ class BraceletController:
             if not self.frozen:
                 overlapping, self.frozen_x, self.frozen_y, self.frozen_w, self.frozen_h, self.frozen = self.check_overlap(hand, target, self.frozen)
             elif self.frozen:
+                self.freezing_time = time.time()
                 overlapping, self.frozen_x, self.frozen_y, self.frozen_w, self.frozen_h, self.frozen = self.check_overlap(hand, frozenBB, self.frozen)
                 frozen_target[:4] = frozenBB
 
@@ -452,6 +461,7 @@ class BraceletController:
 
         # 1. Grasping
         if overlapping:
+            self.grasping_time = time.time()
             self.searching = True
             if belt_controller and self.vibrate:
                 belt_controller.stop_vibration()

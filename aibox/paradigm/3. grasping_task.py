@@ -10,49 +10,40 @@ sys.path.append(str(parent_dir) + '/midas')
 sys.path.append(str(parent_dir) + '/unidepth')
 os.chdir(parent_dir)
 
-import numpy as np
-import pandas as pd
 import json
 import controller
 from bracelet import connect_belt, BraceletController
 
 
-class GraspingTaskController(controller.TaskController):
-
-    def save_output_data(self):
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-        df.to_csv(self.output_path + f"grasping_task_participant_{self.participant}.csv")
-
-
 if __name__ == '__main__':
     
     # Parameters
+    participant = '1'
+    condition = 'grasping'
+    metric = True
+    mock_navigate = False
+    
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
 
-    run_object_tracker = False
+    run_object_tracker = True if condition == 'multiple_objects' else False
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
-    run_depth_estimator = False
-    metric = True
+    run_depth_estimator = True if condition == 'depth_navigation' else False
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
 
-    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
+    source = '0' # image/video path or camera source (0 = webcam, 1 = external, ...)
     belt_controller = None
 
     # Experiment controls
-    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2
-    participant = 1
-    results = str(parent_dir) + '/results/'
-    condition = 'grasping'
-    output_path = results + f'{condition}/'
+    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
+    output_path = 'results/' + f'{condition}/'
 
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
     try:
-        with open(results + 'calibration/' + f"calibration_participant_{participant}.json") as file:
+        with open('results/calibration/' + f"calibration_participant_{participant}.json") as file:
             participant_vibration_intensities = json.load(file)
         print('Calibration intensities loaded succesfully.')
 
@@ -90,7 +81,7 @@ if __name__ == '__main__':
 
     try:
         bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
-        task_controller = GraspingTaskController(weights_obj=weights_obj,  # model_obj path or triton URL
+        task_controller = controller.TaskController(weights_obj=weights_obj,  # model_obj path or triton URL
                         weights_hand=weights_hand,  # model_obj path or triton URL
                         weights_tracker=weights_tracker,
                         weights_depth_estimator=weights_depth_estimator,
@@ -141,6 +132,6 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)
-    
+
     # In the end, close all processes
     controller.close_app(belt_controller)

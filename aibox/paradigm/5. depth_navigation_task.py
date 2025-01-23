@@ -10,48 +10,40 @@ sys.path.append(str(parent_dir) + '/midas')
 sys.path.append(str(parent_dir) + '/unidepth')
 os.chdir(parent_dir)
 
-import numpy as np
-import pandas as pd
 import json
 import controller
 from bracelet import connect_belt, BraceletController
 
 
-class DepthNavigationTaskController(controller.TaskController):
-
-    def save_output_data(self):
-        df = pd.DataFrame(np.array(self.output_data).reshape(len(self.output_data)//3, 3))
-        df.to_csv(self.output_path + f"depth_navigation_task_participant_{self.participant}.csv")
-
-
 if __name__ == '__main__':
 
     # Parameters
+    participant = '0'
+    condition = 'depth_navigation'
+    metric = True
+    mock_navigate = False
+    
     weights_obj = 'yolov5s.pt'  # Object model weights path
     weights_hand = 'hand.pt' # Hands model weights path
 
-    run_object_tracker = False
+    run_object_tracker = True if condition == 'multiple_objects' else False
     weights_tracker = 'osnet_x0_25_market1501.pt' # ReID weights path
 
-    metric = True
+    run_depth_estimator = True if condition == 'depth_navigation' else False
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384' # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
-  
-    source = '1' # image/video path or camera source (0 = webcam, 1 = external, ...)
-    mock_navigate = True # Navigate without the bracelet using only print commands
-    belt_controller = None    
+
+    source = '0' # image/video path or camera source (0 = webcam, 1 = external, ...)
+    belt_controller = None
 
     # Experiment controls
-    target_objs = ['bottle'] * 10
-    participant = 1
-    results = str(parent_dir) + '/results/'
-    condition = 'depth_navigation'
-    output_path = results + f'{condition}/'
+    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
+    output_path = 'results/' + f'{condition}/'
 
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
     try:
-        with open(results + 'calibration/' + f"calibration_participant_{participant}.json") as file:
+        with open('results/calibration/' + f"calibration_participant_{participant}.json") as file:
             participant_vibration_intensities = json.load(file)
         print('Calibration intensities loaded succesfully.')
 
@@ -60,9 +52,9 @@ if __name__ == '__main__':
             continue_with_baseline = input('Error while loading the calibration file. Do you want to continue with baseline intensity of 50 for each vibromotor? (y/n)')
             if continue_with_baseline == 'y':
                 participant_vibration_intensities = {'bottom': 50,
-                                                     'top': 50,
-                                                     'left': 50,
-                                                     'right': 50,}
+                                                        'top': 50,
+                                                        'left': 50,
+                                                        'right': 50,}
                 break
             elif continue_with_baseline == 'n':
                 print('Please try to re-import the calibration file. Aborting.')
@@ -89,11 +81,11 @@ if __name__ == '__main__':
 
     try:
         bracelet_controller = BraceletController(vibration_intensities=participant_vibration_intensities)
-        task_controller = DepthNavigationTaskController(weights_obj=weights_obj,  # model_obj path or triton URL # ROOT
-                        weights_hand=weights_hand,  # model_obj path or triton URL # ROOT
-                        weights_tracker=weights_tracker, # ROOT
+        task_controller = controller.TaskController(weights_obj=weights_obj,  # model_obj path or triton URL
+                        weights_hand=weights_hand,  # model_obj path or triton URL
+                        weights_tracker=weights_tracker,
                         weights_depth_estimator=weights_depth_estimator,
-                        source=source,  # file/dir/URL/glob/screen/0(webcam) # ROOT
+                        source=source,  # file/dir/URL/glob/screen/0(webcam)
                         iou_thres=0.45,  # NMS IOU threshold
                         max_det=1000,  # maximum detections per image
                         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
@@ -104,14 +96,14 @@ if __name__ == '__main__':
                         save_conf=False,  # save confidences in --save-txt labels
                         save_crop=False,  # save cropped prediction boxes
                         nosave=True,  # do not save images/videos
-                        classes_obj=[1,39,40,41,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
+                        classes_obj=[1,39,40,41,42,45,46,47,58,74],  # filter by class /  check coco.yaml file or coco_labels variable in this script
                         classes_hand=[0,1], 
                         #class_hand_nav=[80,81],
                         agnostic_nms=False,  # class-agnostic NMS
                         augment=False,  # augmented inference
                         visualize=False,  # visualize features
                         update=False,  # update all models
-                        project=output_path+'video/',  # save results to project/name # ROOT
+                        project=output_path+'video/',  # save results to project/name
                         name='video',  # save results to project/name
                         exist_ok=False,  # existing project/name ok, do not increment
                         line_thickness=3,  # bounding box thickness (pixels)
@@ -122,10 +114,10 @@ if __name__ == '__main__':
                         vid_stride=1,  # video frame-rate stride_obj
                         manual_entry=False, # True means you will control the exp manually versus the standard automatic running
                         run_object_tracker=run_object_tracker,
-                        run_depth_estimator=True,
+                        run_depth_estimator=run_depth_estimator,
                         mock_navigate=mock_navigate,
                         belt_controller=belt_controller,
-                        tracker_max_age=10,
+                        tracker_max_age=60,
                         tracker_n_init=5,
                         target_objs=target_objs,
                         output_data=[],
@@ -133,13 +125,13 @@ if __name__ == '__main__':
                         condition=condition,
                         participant=participant,
                         participant_vibration_intensities=participant_vibration_intensities,
-                        metric=metric,
-                        bracelet_controller=bracelet_controller) # debugging
+                        bracelet_controller=bracelet_controller,
+                        metric=metric)
         
         task_controller.run()
 
     except KeyboardInterrupt:
         controller.close_app(belt_controller)
-    
+
     # In the end, close all processes
     controller.close_app(belt_controller)

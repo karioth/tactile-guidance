@@ -19,9 +19,11 @@ sys.path.append(str(root) + '/midas')
 
 # Utility
 import time
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import threading
+import queue
 from playsound import playsound
 
 # Image processing
@@ -53,6 +55,17 @@ def beginning_sound():
 def play_start():
     play_start_thread = threading.Thread(target=beginning_sound, name='play_start')
     play_start_thread.start()
+
+def key_listener(key_queue = None):
+    """Thread function to listen for input for each trial."""
+    while True:
+        key = cv2.waitKey(50)
+        """
+        key = input()  # Blocks until the user inputs a key
+        if key in ['s', 'y', 'n', 'c']:  # Accept only 'y' or 'n'
+            key_queue.put((key, datetime.now()))  # Store key and timestamp
+        """
+        return key # Exit after receiving valid input
 
 
 def bbs_to_depth(image, depth=None, bbs=None):
@@ -135,7 +148,7 @@ class TaskController(AutoAssign):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.variables = ['object_class', 'trial_time', 'success']
+        self.variables = ['object_class', 'start_time', 'navigation_time', 'freezing_time', 'grasping_time', 'end_time', 'key']
 
     
     def save_output_data(self):
@@ -252,7 +265,7 @@ class TaskController(AutoAssign):
         return depthmap, outputs
 
 
-    def experiment_trial_logic(self, trial_start_time, trial_end_time, pressed_key):
+    def experiment_trial_logic(self, pressed_key):
         """
         Handles the logic for each trial in the experiment based on the pressed key.
 
@@ -271,10 +284,17 @@ class TaskController(AutoAssign):
         """
 
         # end trial
-        if pressed_key in [ord('y'), ord('n')] and not self.ready_for_next_trial:
+        if pressed_key in [ord('y'), ord('n'), ord('f'), ord('t')] and not self.ready_for_next_trial:
+
             trial_end_time = time.time()
-            print(f'Trial time: {trial_end_time - trial_start_time}')
-            self.output_data.append(trial_end_time - trial_start_time)
+            self.output_data.append(trial_end_time)
+            self.output_data.append(self.bracelet_controller.navigation_time)
+            self.output_data.append(self.bracelet_controller.freezing_time)
+            self.output_data.append(self.bracelet_controller.grasping_time)
+            self.bracelet_controller.navigation_time = 'NA'
+            self.bracelet_controller.freezing_time = 'NA'
+            self.bracelet_controller.grasping_time = 'NA'
+
             self.output_data.append(chr(pressed_key))
 
             self.classes_obj = self.orig_classes_obj
@@ -285,6 +305,10 @@ class TaskController(AutoAssign):
                 print("TRIAL SUCCESSFUL")
             elif pressed_key == ord('n'):
                 print("TRIAL FAILED")
+            elif pressed_key == ord('f'):
+                print("SYSTEM FAILED")
+            elif pressed_key == ord('t'):
+                print("WRONG TARGET")
             
             if self.obj_index >= len(self.target_objs) - 1:
                 print("ALL TARGETS COVERED")
@@ -299,13 +323,23 @@ class TaskController(AutoAssign):
         # start next trial
         elif pressed_key == ord('s') and self.ready_for_next_trial:
             print("STARTING NEXT TRIAL")
+            trial_start_time = time.time()
+            self.output_data.append(trial_start_time)
             self.target_entered = False
             self.ready_for_next_trial = False
             self.bracelet_controller.vibrate = True
 
         # end experiment
         elif pressed_key == ord('c'): # 'q' interferes with opencv
+
+            self.output_data.append(self.bracelet_controller.navigation_time)
+            self.output_data.append(self.bracelet_controller.freezing_time)
+            self.output_data.append(self.bracelet_controller.grasping_time)
+
+            self.output_data.append(chr(pressed_key))
+
             self.save_output_data()
+
             if self.belt_controller:
                 self.belt_controller.stop_vibration()
             return "break"
@@ -353,10 +387,15 @@ class TaskController(AutoAssign):
         self.ready_for_next_trial = True
         self.target_entered = True # counter intuitive, but setting as True to wait for press of "s" button to start first trial
         self.class_target_obj = -1 # placeholder value not assigned to any specific object
-        trial_start_time = -1 # placeholder initial value
         self.orig_classes_obj = self.classes_obj
 
         grasped = False
+
+        # Start key listener thread
+        key_queue = queue.Queue()  # Fresh queue for each trial
+        pressed_key = None
+        listener_thread = threading.Thread(target=key_listener, args=(key_queue,), daemon=True)
+        listener_thread.start()
 
         # Data processing: Iterate over each frame of the live stream
         for frame, (path, im, im0s, vid_cap, _) in enumerate(self.dataset):
@@ -503,7 +542,6 @@ class TaskController(AutoAssign):
                 self.target_entered = True
                 self.classes_obj = [self.class_target_obj] # only detect the target object --> filtering of detections (and therefore tracks)
                 grasped = False
-                trial_start_time = time.time()
                 vibration_timer = None
 
             # Navigate the hand based on information from last frame and current frame detections
@@ -550,12 +588,16 @@ class TaskController(AutoAssign):
                 else:
                     cv2.imshow("AIBox", im0)
                     cv2.setWindowProperty("AIBox", cv2.WND_PROP_TOPMOST, 1)
+                
+                """
+                # Check if a key has been pressed
+                if not key_queue.empty():
+                    pressed_key, trial_end_time = key_queue.get()
+                    print(key_queue)
+                """
 
                 pressed_key = cv2.waitKey(1)
-
-                trial_end_time = time.time()
-
-                trial_info = self.experiment_trial_logic(trial_start_time, trial_end_time, pressed_key)
+                trial_info = self.experiment_trial_logic(pressed_key)
                 
                 if trial_info == "break":
                     break

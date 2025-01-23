@@ -57,14 +57,14 @@ def calibrate_intensity(direction):
             intensity -= 5
             time.sleep(0.1)
         elif keyboard.is_pressed('y'):
-            belt_controller.yystop_vibration()
+            belt_controller.stop_vibration()
             time.sleep(1)
             return intensity
 
 
 if __name__ == '__main__':
 
-    participant = 1
+    participant = 0
     output_path = str(parent_dir) + '/results/calibration/'
 
     if not os.path.exists(output_path):
