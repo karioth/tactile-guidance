@@ -16,6 +16,17 @@ sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
 sys.path.append(str(root) + '/unidepth')
 sys.path.append(str(root) + '/midas')
+sys.path.append(str(root) + '/GroundingDINO')
+sys.path.append(str(root) + '/Grounded-SAM-2')
+sys.path.append(str(root) + '/vision_bridge')
+
+# ---------------------------------------------------------------------------
+# Make sure sibling modules (e.g. vision_bridge) are importable
+# Note: vision_bridge is now local, but keep this for backward compatibility
+# ---------------------------------------------------------------------------
+project_root = root.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 # Utility
 import time
@@ -43,9 +54,22 @@ from ultralytics import YOLO
 from ultralytics.nn.autobackend import AutoBackend
 
 # Depth Estimation
-from unidepth_estimator import UniDepthEstimator # metric
+try:
+    from unidepth_estimator import UniDepthEstimator # metric
+except:
+    UniDepthEstimator = None
+
 from midas_estimator import MidasDepthEstimator # relative
 from midas.run import create_side_by_side
+
+# ---------------------------------------------------------------------------
+# Optional Grounded-SAM-2 backend (open-vocabulary)  
+# Updated to use local vision_bridge
+# ---------------------------------------------------------------------------
+try:
+    from gsam2_wrapper import GSAM2Wrapper
+except ModuleNotFoundError:
+    GSAM2Wrapper = None  # Fallback to YOLO only if wrapper is missing
 
 
 def beginning_sound():
@@ -146,8 +170,24 @@ class AutoAssign:
 
 class TaskController(AutoAssign):
 
-    def __init__(self, **kwargs):
+    def __init__(self, backend: str = "yolo", **kwargs):
         super().__init__(**kwargs)
+        # Allowed backends: 'yolo' (default) or 'gsam2'
+        self.backend = backend.lower()
+        if self.backend not in ["yolo", "gsam2"]:
+            raise ValueError(f"Unknown backend '{self.backend}'. Use 'yolo' or 'gsam2'.")
+
+        # If GSAM-2 backend requested, instantiate wrapper (if available)
+        if self.backend == "gsam2":
+            if GSAM2Wrapper is None:
+                raise ImportError("GSAM2Wrapper could not be imported. Make sure vision_bridge/gsam2_wrapper.py exists and its dependencies are installed.")
+            self.prompt = kwargs.get('prompt', 'coffee cup')
+            self.gsam2 = GSAM2Wrapper()
+            self.gsam2.set_prompt(None, self.prompt)
+            # Provide a placeholder label dictionary: use the prompt itself for nicer videos
+            self.names_obj = {0: self.prompt}
+        else:
+            self.gsam2 = None
         self.variables = ['object_class', 'start_time', 'navigation_time', 'freezing_time', 'grasping_time', 'end_time', 'key']
 
     
@@ -164,23 +204,40 @@ class TaskController(AutoAssign):
 
 
     def load_object_detector(self):
-        
-        print(f'\nLOADING OBJECT DETECTORS')
-        
         self.device = select_device(self.device)
-        self.model_obj = DetectMultiBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
-        #self.model_obj = AutoBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
-        #self.model_obj = YOLO(self.weights_obj, task='detect')
-        #self.model_obj.to('cuda')
-        self.model_hand = DetectMultiBackend(self.weights_hand, device=self.device, dnn=self.dnn, fp16=self.half)
 
-        self.names_obj = self.model_obj.names        
-        #self.stride_obj, self.names_obj, self.pt_obj = self.model_obj.stride, self.model_obj.names, self.model_obj.pt
-        self.stride_hand, self.names_hand, self.pt_hand = self.model_hand.stride, self.model_hand.names, self.model_hand.pt
-        #self.imgsz = check_img_size(self.imgsz, s=self.stride_obj) # check image size
+        if self.backend == "yolo":
+            print(f'\nLOADING OBJECT DETECTORS (YOLO)')
+
+            self.model_obj = DetectMultiBackend(self.weights_obj, device=self.device, dnn=self.dnn, fp16=self.half)
+            self.names_obj = self.model_obj.names
+
+        else:  # gsam2 path → skip object YOLO, keep placeholder names_obj already set
+            self.model_obj = None
+
+        # Hand detector is always required
+        print("Loading hand detector …")
+
+        hand_weights = Path(self.weights_hand)
+        if not hand_weights.is_file():
+            # allow relative filenames like 'hand.pt' – resolve to aibox directory
+            candidate = Path(__file__).resolve().parent / hand_weights.name
+            if candidate.is_file():
+                hand_weights = candidate
+            else:
+                raise FileNotFoundError(f"Hand-detector weights not found: {self.weights_hand}")
+
+        self.model_hand = DetectMultiBackend(str(hand_weights), device=self.device, dnn=self.dnn, fp16=self.half)
+        self.stride_hand, self.names_hand, self.pt_hand = (
+            self.model_hand.stride,
+            self.model_hand.names,
+            self.model_hand.pt,
+        )
+
+        # Timing profiles for dt[0], dt[1], dt[2]
         self.dt = (Profile(), Profile(), Profile())
 
-        print(f'\nOBJECT DETECTORS LOADED SUCCESFULLY')
+        print(f'\nDETECTOR(S) LOADED SUCCESSFULLY')
 
 
     def load_object_tracker(self, max_age=70, n_init=3):
@@ -345,6 +402,50 @@ class TaskController(AutoAssign):
             return "break"
 
 
+    def convert_and_combine_detections(self, gsam2_objects, yolo_hands_tensor, im, im0, index_add):
+        """
+        Convert and combine GSAM2 object detections with YOLO hand detections
+        into unified Detection format: (xc, yc, w, h, track_id, class_id, conf, depth)
+        
+        Args:
+            gsam2_objects: List of GSAM2 detections (already in Detection format)
+            yolo_hands_tensor: YOLO hand predictions tensor (xyxy format)
+            im: Preprocessed image tensor
+            im0: Original image array
+            index_add: Offset to add to hand class IDs
+            
+        Returns:
+            List of combined detections in unified format
+        """
+        combined = []
+        
+        # Add GSAM2 objects (already in correct format)
+        combined.extend(gsam2_objects)
+        
+        # Add YOLO hands (convert from xyxy to Detection format)
+        if len(yolo_hands_tensor) > 0 and yolo_hands_tensor.numel() > 0:
+            # Scale boxes to original image size - use shape[1:] to get (height, width)
+            hands_xyxy = scale_boxes(im.shape[1:], yolo_hands_tensor[:, :4], im0.shape).round()
+            # Convert to xywh format  
+            hands_xywh = xyxy2xywh(hands_xyxy)
+            
+            for i, hand in enumerate(yolo_hands_tensor):
+                # Create Detection tuple: (xc, yc, w, h, track_id, class_id, conf, depth)
+                detection = np.array([
+                    float(hands_xywh[i][0]),        # xc - center x
+                    float(hands_xywh[i][1]),        # yc - center y  
+                    float(hands_xywh[i][2]),        # w - width
+                    float(hands_xywh[i][3]),        # h - height
+                    -1,                             # track_id (no tracking)
+                    int(hand[5]) + index_add,       # class_id (0,1 -> 80,81)
+                    float(hand[4]),                 # confidence
+                    -1                              # depth (placeholder)
+                ])
+                combined.append(detection)
+        
+        return combined
+
+
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
         """
         Main loop for running the experiment, processing each frame of the live stream.
@@ -404,51 +505,118 @@ class TaskController(AutoAssign):
             start = time.perf_counter()
 
             # Setup saving and visualization
-            p, im0 = Path(path[0]), im0s[0].copy() # idx 0 is for first source (and we only have one source)
+            if isinstance(path, (list, tuple)):
+                p = Path(path[0])
+                im0 = im0s[0].copy()
+            else:
+                p = Path(path)
+                im0 = im0s.copy()
             save_path = str(save_dir / p.name)  # im.jpg
             annotator = Annotator(im0, line_width=self.line_thickness, example=str(self.names_obj))
 
             # Image pre-processing
-            with self.dt[0]:
-                image = torch.from_numpy(im).to(self.model_obj.device)
-                #image = image.half() if self.model_obj.fp16 else image.float()  # uint8 to fp16/32
-                image = image.half() if self.model_hand.fp16 else image.float()
-                image /= 255  # 0 - 255 to 0.0 - 1.0
-                if len(image.shape) == 3:
-                    image = image[None]  # expand for batch dim
+            if self.backend == "gsam2":
+                # Image preprocessing for YOLO hand model
+                with self.dt[0]:
+                    image = torch.from_numpy(im).to(self.model_hand.device)
+                    image = image.half() if self.model_hand.fp16 else image.float()
+                    image /= 255  # 0 - 255 to 0.0 - 1.0
+                    if len(image.shape) == 3:
+                        image = image[None]  # expand for batch dim
 
-            # Object detection inference
-            with self.dt[1]:
-                visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
-                pred_target = self.model_obj(image, augment=self.augment, visualize=visualize) # YOLO11 runs nms by default
-                pred_hand = self.model_hand(image, augment=self.augment, visualize=visualize)
+                # Hand detection via YOLO (NEW)
+                with self.dt[1]:
+                    visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
+                    pred_hand = self.model_hand(image, augment=self.augment, visualize=visualize)
 
-            # Non-maximal supression
-            with self.dt[2]:
-                pred_target = non_max_suppression(pred_target, self.conf_thres, self.iou_thres, self.classes_obj, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
-                pred_hand = non_max_suppression(pred_hand, self.conf_thres, self.iou_thres, self.classes_hand, self.agnostic_nms, max_det=self.max_det) # list containing one tensor (n,6)
+                # Non-max suppression for hand detections
+                with self.dt[2]:
+                    pred_hand = non_max_suppression(
+                        pred_hand,
+                        self.conf_thres,
+                        self.iou_thres,
+                        self.classes_hand,
+                        self.agnostic_nms,
+                        max_det=self.max_det,
+                    )
 
-            for hand in pred_hand[0]:
-                if len(hand):
-                    hand[5] += index_add # assign correct classID by adding len(coco_labels)
+                # Open-vocabulary object detection via Grounding-DINO
+                gsam2_objects = self.gsam2.track(im0)  # list[ndarray] (may be empty)
+
+                # Combine GSAM2 objects + YOLO hands into unified format
+                outputs = self.convert_and_combine_detections(gsam2_objects, pred_hand[0], im, im0, index_add)
+
+                # Placeholders required by later branches (not used in GSAM2 path)
+                xywhs = torch.empty(0, 4)
+                confs = torch.empty(0)
+                clss = torch.empty(0)
+
+                # Disable StrongSORT tracker in GSAM-2 backend for now
+                self.run_object_tracker = False
+
+            else:
+                # ------------------------------------------------------------
+                # Original YOLOv5 + StrongSORT path
+                # ------------------------------------------------------------
+                with self.dt[0]:
+                    image = torch.from_numpy(im).to(self.model_obj.device)
+                    image = image.half() if self.model_hand.fp16 else image.float()
+                    image /= 255  # 0 - 255 to 0.0 - 1.0
+                    if len(image.shape) == 3:
+                        image = image[None]  # expand for batch dim
+
+            # Object detection (YOLO) – only if backend == yolo
+            if self.backend == "yolo":
+                with self.dt[1]:
+                    visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
+                    pred_target = self.model_obj(image, augment=self.augment, visualize=visualize)  # YOLO runs NMS by default
+
+                # Non-max suppression for YOLO detections
+                with self.dt[2]:
+                    pred_target = non_max_suppression(
+                        pred_target,
+                        self.conf_thres,
+                        self.iou_thres,
+                        self.classes_obj,
+                        self.agnostic_nms,
+                        max_det=self.max_det,
+                    )  # list containing one tensor (n,6)
+
+                # Hand detection via YOLO (for YOLO backend)
+                pred_hand = self.model_hand(image, augment=self.augment)
+                pred_hand = non_max_suppression(
+                    pred_hand,
+                    self.conf_thres,
+                    self.iou_thres,
+                    self.classes_hand,
+                    self.agnostic_nms,
+                    max_det=self.max_det,
+                )
+
+            # Fix hand class IDs for YOLO backend only
+            if self.backend == "yolo":
+                for hand in pred_hand[0]:
+                    if len(hand):
+                        hand[5] += index_add  # assign correct classID by adding len(coco_labels)
 
             # Camera motion compensation for tracker (ECC)
             if self.run_object_tracker:
                 curr_frames = im0
                 self.tracker.tracker.camera_update(prev_frames, curr_frames)
             
-            # Initialize/clear detections
-            xywhs = torch.empty(0,4)
-            confs = torch.empty(0)
-            clss = torch.empty(0)
+            # Initialize/clear detections (YOLO path)
+            if self.backend == "yolo":
+                xywhs = torch.empty(0, 4)
+                confs = torch.empty(0)
+                clss = torch.empty(0)
 
-            # Process object detections
-            preds = torch.cat((pred_target[0], pred_hand[0]), dim=0) # (x, y, x, y, conf, cls)
-            if len(preds) > 0:
-                preds[:, :4] = scale_boxes(im.shape[2:], preds[:, :4], im0.shape).round()
-                xywhs = xyxy2xywh(preds[:, :4])
-                confs = preds[:, 4]
-                clss = preds[:, 5]
+                # Process object detections
+                preds = torch.cat((pred_target[0], pred_hand[0]), dim=0)  # (x, y, x, y, conf, cls)
+                if len(preds) > 0:
+                    preds[:, :4] = scale_boxes(im.shape[2:], preds[:, :4], im0.shape).round()
+                    xywhs = xyxy2xywh(preds[:, :4])
+                    confs = preds[:, 4]
+                    clss = preds[:, 5]
 
             # Generate tracker outputs for navigation
             if self.run_object_tracker:
@@ -461,17 +629,23 @@ class TaskController(AutoAssign):
                     hand_index_list = [hand + index_add for hand in self.classes_hand]
                     outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
-            else: # without tracking
+            else:  # without tracking
 
-                outputs = np.array(preds.cpu()) # (x, y, x, y, conf, cls)
-                outputs = np.insert(outputs, 4, -1, axis=1) # insert track_id placeholder --> (x, y, x, y, track_id, conf, cls)
-                outputs[:, [5, 6]] = outputs[:, [6, 5]] # switch cls and conf to match the output of the tracker --> (x, y, x, y, track_id, cls, conf)
+                if self.backend == "yolo":
+                    outputs = np.array(preds.cpu())  # (x, y, x, y, conf, cls)
+                    outputs = np.insert(outputs, 4, -1, axis=1)  # insert track_id placeholder
+                    outputs[:, [5, 6]] = outputs[:, [6, 5]]  # switch cls and conf -> (x, y, x, y, track_id, cls, conf)
+                else:
+                    # GSAM2 path: outputs already produced and combined earlier
+                    outputs = np.array(outputs)
 
-            # Convert xyxy to xywh
-            outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
+            # Convert xyxy to xywh (only for YOLO backend, GSAM2 already in correct format)
+            if self.backend == "yolo":
+                outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
 
-            # Add depth placeholder to outputs
-            outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
+            # Add depth placeholder to outputs (only for YOLO backend, GSAM2 already has it)
+            if self.backend == "yolo":
+                outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -560,17 +734,22 @@ class TaskController(AutoAssign):
             # VISUALIZATIONS
 
             # Write results
-            for *xywh, obj_id, cls, conf, depth in outputs:
-                id, cls = int(obj_id), int(cls)
-                xyxy = xywh2xyxy(np.array(xywh))
-                if save_img or self.save_crop or self.view_img:
-                    label = None if self.hide_labels else (f'ID: {id} {self.master_label[cls]}' if self.hide_conf else (f'ID: {id} {self.master_label[cls]} {conf:.2f} {depth:.2f}'))
-                    annotator.box_label(xyxy, label, color=colors(cls, True))
+            for detection in outputs:
+                if len(detection) >= 8:  # Ensure we have a complete Detection tuple
+                    xc, yc, w, h, track_id, cls, conf, depth = detection
+                    # Convert center-based to corner-based coordinates
+                    xyxy = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
+                    id, cls = int(track_id), int(cls)
+                    if save_img or self.save_crop or self.view_img:
+                        label = None if self.hide_labels else (f'ID: {id} {self.master_label[cls]}' if self.hide_conf else (f'ID: {id} {self.master_label[cls]} {conf:.2f} {depth:.2f}'))
+                        annotator.box_label(xyxy, label, color=colors(cls, True))
 
             # Target BB
             if curr_target is not None:
-                for *xywh, obj_id, cls, conf, depth in [curr_target]:
-                    xyxy = xywh2xyxy(np.array(xywh))
+                if len(curr_target) >= 8:  # Ensure we have a complete Detection tuple
+                    xc, yc, w, h, track_id, cls, conf, depth = curr_target
+                    # Convert center-based to corner-based coordinates  
+                    xyxy = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
                     if save_img or self.save_crop or self.view_img:
                         label = None if self.hide_labels else 'Target object'
                         annotator.box_label(xyxy, label, color=(0,0,0))
@@ -597,6 +776,13 @@ class TaskController(AutoAssign):
                 """
 
                 pressed_key = cv2.waitKey(1)
+                # User can press 'p' to set a new open-vocabulary prompt on the fly (GSAM-2 backend only)
+                if self.backend == "gsam2" and pressed_key == ord('p'):
+                    new_prompt = input("Enter new text prompt for Grounding-DINO: ")
+                    if new_prompt:
+                        self.gsam2.set_prompt(None, new_prompt)
+                        self.names_obj = {0: new_prompt}
+                        print(f"Prompt updated → '{new_prompt}'")
                 trial_info = self.experiment_trial_logic(pressed_key)
                 
                 if trial_info == "break":
@@ -657,11 +843,21 @@ class TaskController(AutoAssign):
 
         # Load data stream
         self.bs = 1  # batch_size
-        view_img = check_imshow(warn=True)
+        # Only try to open an OpenCV window when the user explicitly
+        # requested visualisation (--view flag).  Calling check_imshow()
+        # on a head-less GPU node raises a Qt/XCB error.
+        if self.view_img:
+            view_img = check_imshow(warn=True)
+        else:
+            view_img = False
 
         try:
-            #self.dataset = LoadStreams(source, img_size=self.imgsz, stride=self.stride_obj, auto=True, vid_stride=self.vid_stride)
-            self.dataset = LoadStreams(source, img_size=640)
+            if webcam or is_url or screenshot:
+                # Live sources (webcam/stream/screen)
+                self.dataset = LoadStreams(source, img_size=640)
+            else:
+                # Image or video file → use LoadImages to avoid treating binary as text
+                self.dataset = LoadImages(source, img_size=640)
 
         except AssertionError:
             while True:
@@ -678,9 +874,19 @@ class TaskController(AutoAssign):
         vid_path, vid_writer = [None] * self.bs, [None] * self.bs
 
         # Create combined label dictionary
-        index_add = len(self.names_obj)
-        labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
-        self.master_label = self.names_obj | labels_hand_adj
+        if self.backend == "yolo":
+            index_add = len(self.names_obj)
+            labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
+            self.master_label = self.names_obj | labels_hand_adj
+        else:
+            # GSAM2 backend: offset hand labels to avoid conflict with object at index 0
+            index_add = len(self.names_obj)  # Object uses 0, hands start at 1
+            labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
+            self.master_label = self.names_obj | labels_hand_adj
+
+        # Disable tracker for GSAM2 backend (must happen before potential loading)
+        if self.backend == "gsam2":
+            self.run_object_tracker = False
 
         # Load tracker model
         if self.run_object_tracker:
