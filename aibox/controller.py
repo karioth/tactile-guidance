@@ -512,6 +512,16 @@ class TaskController(AutoAssign):
                 p = Path(path)
                 im0 = im0s.copy()
             save_path = str(save_dir / p.name)  # im.jpg
+            
+            # For GSAM2 backend, include the prompt in the filename
+            if self.backend == "gsam2":
+                # Clean prompt for filename (replace spaces and special chars)
+                clean_prompt = "".join(c if c.isalnum() else "_" for c in self.prompt)
+                p_stem = Path(p.name).stem
+                p_suffix = Path(p.name).suffix
+                new_name = f"{p_stem}_{clean_prompt}_result{p_suffix}"
+                save_path = str(save_dir / new_name)
+                
             annotator = Annotator(im0, line_width=self.line_thickness, example=str(self.names_obj))
 
             # Image pre-processing
