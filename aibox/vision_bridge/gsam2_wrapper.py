@@ -51,6 +51,7 @@ class GSAM2Wrapper:
         box_threshold: float = 0.35,
         text_threshold: float = 0.25,
         default_prompt: str = "coffee cup",
+        handedness: str = "right",
     ) -> None:
         self.device = (
             torch.device(device)
@@ -59,6 +60,7 @@ class GSAM2Wrapper:
         )
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
+        self.handedness = handedness
 
         # Load Grounding-DINO once.
         self._gdino = GDINOModel(
@@ -91,19 +93,23 @@ class GSAM2Wrapper:
         frame_bgr: np.ndarray,
         depth_img: Optional[np.ndarray] = None,
     ) -> List[np.ndarray]:
-        """Detect the target object in *frame_bgr*.
+        """Detect the target object and hands in *frame_bgr* using multi-prompt.
 
         Returns
         -------
         list[np.ndarray]
-            Either empty or a single ndarray with shape (8,) holding:
+            List of ndarray with shape (8,) holding:
             ``[xc, yc, w, h, track_id, class_id, conf, depth]`` in the
             Detection format expected by the controller.
+            class_id: 0 = target object, 1 = hand
         """
+        # Multi-prompt: combine object prompt with handedness-specific hand detection
+        multi_prompt = f"{self._prompt}. my {self.handedness} hand"
+        
         # Grounding-DINO expects BGR OpenCV image (height, width, 3)
-        detections, _ = self._gdino.predict_with_caption(
+        detections, labels = self._gdino.predict_with_caption(
             image=frame_bgr,
-            caption=self._prompt,
+            caption=multi_prompt,
             box_threshold=self.box_threshold,
             text_threshold=self.text_threshold,
         )
@@ -111,18 +117,59 @@ class GSAM2Wrapper:
         if len(detections.xyxy) == 0:
             return []
 
-        # Pick the highest-confidence detection.
-        idx = int(np.argmax(detections.confidence))
-        x1, y1, x2, y2 = detections.xyxy[idx]
-        conf = float(detections.confidence[idx])
-
-        # Convert from xyxy to xywh (center format)
-        xc = (x1 + x2) / 2
-        yc = (y1 + y2) / 2
-        w = x2 - x1
-        h = y2 - y1
-
-        # Build detection tuple in Detection format: (xc, yc, w, h, track_id, class_id, conf, depth)
-        # track_id = -1 (no tracker), class_id = 0 (placeholder), depth = -1 (placeholder)
-        det = np.array([xc, yc, w, h, -1, 0, conf, -1], dtype=float)
-        return [det] 
+        # Separate object and hand detections
+        object_detections = []
+        hand_detections = []
+        
+        for i in range(len(detections.xyxy)):
+            x1, y1, x2, y2 = detections.xyxy[i]
+            conf = float(detections.confidence[i])
+            label = labels[i].lower() if i < len(labels) else ""
+            
+            # Convert from xyxy to xywh (center format)
+            xc = (x1 + x2) / 2
+            yc = (y1 + y2) / 2
+            w = x2 - x1
+            h = y2 - y1
+            
+            # Classify based on label content
+            if "hand" in label:
+                # Build hand detection tuple with confidence for sorting
+                det = np.array([xc, yc, w, h, -1, 1, conf, -1], dtype=float)
+                hand_detections.append((det, conf))
+            else:
+                # Build object detection tuple with confidence for sorting
+                det = np.array([xc, yc, w, h, -1, 0, conf, -1], dtype=float)
+                object_detections.append((det, conf))
+        
+        # Select only the highest confidence object detection (for navigation)
+        results = []
+        if object_detections:
+            # Sort by confidence and take the best one
+            object_detections.sort(key=lambda x: x[1], reverse=True)
+            best_object = object_detections[0][0]  # Get the detection array
+            results.append(best_object)
+        
+        # Select only the highest confidence hand detection (apply same logic as objects)
+        if hand_detections:
+            # Sort by confidence and take the best one
+            hand_detections.sort(key=lambda x: x[1], reverse=True)
+            best_hand = hand_detections[0][0]  # Get the detection array
+            # Apply egocentric filtering to the single best hand
+            filtered_hands = self._filter_egocentric_hands([best_hand], frame_bgr.shape)
+            results.extend(filtered_hands)
+        
+        return results
+    
+    def _filter_egocentric_hands(self, detections: List[np.ndarray], frame_shape: tuple) -> List[np.ndarray]:
+        """Filter to most likely egocentric hand based on spatial rules and handedness.
+        
+        Args:
+            detections: List of hand detection arrays
+            frame_shape: (height, width, channels) of the frame
+            
+        Returns:
+            Filtered list of hand detections
+        """
+        # Placeholder implementation - return all detections as-is
+        return detections 

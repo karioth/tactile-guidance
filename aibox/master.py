@@ -72,6 +72,12 @@ if __name__ == '__main__':
         default="coffee cup",
         help="Text prompt for Grounding-DINO when --backend gsam2 is used.",
     )
+    parser.add_argument(
+        "--handedness",
+        choices=["left", "right"],
+        default="right",
+        help="Which hand is wearing the bracelet (default: right).",
+    )
     
     
     # Parse the arguments
@@ -188,7 +194,8 @@ if __name__ == '__main__':
             participant_vibration_intensities=participant_vibration_intensities,
             bracelet_controller=bracelet_controller,
             metric=metric,
-            prompt=args.prompt)
+            prompt=args.prompt,
+            handedness=args.handedness)
         
         task_controller.run()
 

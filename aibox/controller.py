@@ -63,7 +63,7 @@ from midas_estimator import MidasDepthEstimator # relative
 from midas.run import create_side_by_side
 
 # ---------------------------------------------------------------------------
-# Optional Grounded-SAM-2 backend (open-vocabulary)  
+# Optional Grounded-SAM-2 backend (open-vocabulary)
 # Updated to use local vision_bridge
 # ---------------------------------------------------------------------------
 try:
@@ -182,7 +182,8 @@ class TaskController(AutoAssign):
             if GSAM2Wrapper is None:
                 raise ImportError("GSAM2Wrapper could not be imported. Make sure vision_bridge/gsam2_wrapper.py exists and its dependencies are installed.")
             self.prompt = kwargs.get('prompt', 'coffee cup')
-            self.gsam2 = GSAM2Wrapper()
+            self.handedness = kwargs.get('handedness', 'right')
+            self.gsam2 = GSAM2Wrapper(handedness=self.handedness)
             self.gsam2.set_prompt(None, self.prompt)
             # Provide a placeholder label dictionary: use the prompt itself for nicer videos
             self.names_obj = {0: self.prompt}
@@ -215,7 +216,8 @@ class TaskController(AutoAssign):
         else:  # gsam2 path → skip object YOLO, keep placeholder names_obj already set
             self.model_obj = None
 
-        # Hand detector is always required
+        # Hand detector only required for YOLO backend
+        if self.backend == "yolo":
         print("Loading hand detector …")
 
         hand_weights = Path(self.weights_hand)
@@ -233,6 +235,10 @@ class TaskController(AutoAssign):
             self.model_hand.names,
             self.model_hand.pt,
         )
+        else:  # gsam2 path → skip hand YOLO, use multi-prompt GDINO
+            self.model_hand = None
+            handedness = getattr(self, 'handedness', 'right')
+            self.stride_hand, self.names_hand, self.pt_hand = None, {1: f'{handedness} hand'}, False
 
         # Timing profiles for dt[0], dt[1], dt[2]
         self.dt = (Profile(), Profile(), Profile())
@@ -284,6 +290,7 @@ class TaskController(AutoAssign):
 
         if type == 'detector':
             #model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
+            if self.model_hand is not None:  # Only warmup if hand model is loaded
             model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
         
         if type == 'tracker':
@@ -526,35 +533,8 @@ class TaskController(AutoAssign):
 
             # Image pre-processing
             if self.backend == "gsam2":
-                # Image preprocessing for YOLO hand model
-                with self.dt[0]:
-                    image = torch.from_numpy(im).to(self.model_hand.device)
-                    image = image.half() if self.model_hand.fp16 else image.float()
-                    image /= 255  # 0 - 255 to 0.0 - 1.0
-                    if len(image.shape) == 3:
-                        image = image[None]  # expand for batch dim
-
-                # Hand detection via YOLO (NEW)
-                with self.dt[1]:
-                    visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if self.visualize else False
-                    pred_hand = self.model_hand(image, augment=self.augment, visualize=visualize)
-
-                # Non-max suppression for hand detections
-                with self.dt[2]:
-                    pred_hand = non_max_suppression(
-                        pred_hand,
-                        self.conf_thres,
-                        self.iou_thres,
-                        self.classes_hand,
-                        self.agnostic_nms,
-                        max_det=self.max_det,
-                    )
-
-                # Open-vocabulary object detection via Grounding-DINO
-                gsam2_objects = self.gsam2.track(im0)  # list[ndarray] (may be empty)
-
-                # Combine GSAM2 objects + YOLO hands into unified format
-                outputs = self.convert_and_combine_detections(gsam2_objects, pred_hand[0], im, im0, index_add)
+                # Multi-prompt detection via Grounding-DINO (object + hands)
+                outputs = self.gsam2.track(im0)  # Returns list[ndarray] with both objects and hands
 
                 # Placeholders required by later branches (not used in GSAM2 path)
                 xywhs = torch.empty(0, 4)
@@ -605,9 +585,9 @@ class TaskController(AutoAssign):
 
             # Fix hand class IDs for YOLO backend only
             if self.backend == "yolo":
-                for hand in pred_hand[0]:
-                    if len(hand):
-                        hand[5] += index_add  # assign correct classID by adding len(coco_labels)
+            for hand in pred_hand[0]:
+                if len(hand):
+                    hand[5] += index_add  # assign correct classID by adding len(coco_labels)
 
             # Camera motion compensation for tracker (ECC)
             if self.run_object_tracker:
@@ -651,11 +631,11 @@ class TaskController(AutoAssign):
 
             # Convert xyxy to xywh (only for YOLO backend, GSAM2 already in correct format)
             if self.backend == "yolo":
-                outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
+            outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
 
             # Add depth placeholder to outputs (only for YOLO backend, GSAM2 already has it)
             if self.backend == "yolo":
-                outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
+            outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
 
             # Calculate difference between current and previous frame
             if prev_frames is not None:
@@ -750,9 +730,9 @@ class TaskController(AutoAssign):
                     # Convert center-based to corner-based coordinates
                     xyxy = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
                     id, cls = int(track_id), int(cls)
-                    if save_img or self.save_crop or self.view_img:
-                        label = None if self.hide_labels else (f'ID: {id} {self.master_label[cls]}' if self.hide_conf else (f'ID: {id} {self.master_label[cls]} {conf:.2f} {depth:.2f}'))
-                        annotator.box_label(xyxy, label, color=colors(cls, True))
+                if save_img or self.save_crop or self.view_img:
+                    label = None if self.hide_labels else (f'ID: {id} {self.master_label[cls]}' if self.hide_conf else (f'ID: {id} {self.master_label[cls]} {conf:.2f} {depth:.2f}'))
+                    annotator.box_label(xyxy, label, color=colors(cls, True))
 
             # Target BB
             if curr_target is not None:
@@ -889,10 +869,9 @@ class TaskController(AutoAssign):
             labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
             self.master_label = self.names_obj | labels_hand_adj
         else:
-            # GSAM2 backend: offset hand labels to avoid conflict with object at index 0
-            index_add = len(self.names_obj)  # Object uses 0, hands start at 1
-            labels_hand_adj = {key + index_add: value for key, value in self.names_hand.items()}
-            self.master_label = self.names_obj | labels_hand_adj
+            # GSAM2 backend: hands use class_id=1 directly, no offset needed
+            index_add = 0  # No offset needed for GSAM2
+            self.master_label = self.names_obj | self.names_hand
 
         # Disable tracker for GSAM2 backend (must happen before potential loading)
         if self.backend == "gsam2":
@@ -912,6 +891,7 @@ class TaskController(AutoAssign):
 
         # Warmup models
         #self.warmup_model(self.model_obj)
+        if self.model_hand is not None:  # Only warmup hand model if it exists
         self.warmup_model(self.model_hand)
         if self.run_object_tracker:
             self.warmup_model(self.tracker.model,'tracker')
