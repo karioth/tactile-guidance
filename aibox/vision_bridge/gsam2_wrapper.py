@@ -499,22 +499,6 @@ class GSAM2Wrapper:
             print(f"❌ Unified detection failed: {e}")
             return False
 
-    def _prime_sam2_with_detection(self, frame_rgb: np.ndarray) -> bool:
-        """Prime SAM-2 with object and hand detection from first frame."""
-        multi_prompt = f"{self._prompt}. my {self.handedness} hand"
-        return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
-
-    def _prime_sam2_detection_logic(self, frame_rgb: np.ndarray, operation_type: str) -> bool:
-        """Shared logic for SAM-2 priming and recovery operations."""
-        multi_prompt = f"{self._prompt}. my {self.handedness} hand"
-        
-        if operation_type == "recovery":
-            # For recovery, we need to handle state management differently
-            return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
-        else:
-            # For priming, normal flow
-            return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
-
     def _select_best_candidate(self, candidates: List[tuple]) -> Optional[tuple]:
         """Simplified candidate selection - just pick highest confidence."""
         if not candidates:
@@ -543,6 +527,25 @@ class GSAM2Wrapper:
         )
         
         return detections, labels
+
+    def _should_attempt_detection(self, detection_type: str = "detection") -> bool:
+        """Unified search timing logic to avoid duplication.
+        
+        Args:
+            detection_type: Type of detection for logging ("hand", "object", "detection")
+            
+        Returns:
+            bool: True if detection should be attempted this frame
+        """
+        # Attempt detection immediately on first frame (counter=0), then every 15 frames
+        if self._search_frame_counter == 0 or self._search_frame_counter >= self._search_interval:
+            print(f"🔍 Attempting {detection_type} detection...")
+            self._search_frame_counter = 1  # Set to 1 after detection attempt
+            return True
+        else:
+            # Count frames between detection attempts
+            self._search_frame_counter += 1
+            return False
 
     @torch.inference_mode()
     def track(
@@ -588,23 +591,13 @@ class GSAM2Wrapper:
             # Only attempt object detection if still in SEARCHING_OBJECT state
             if current_state_after_sam2 == TrackingState.SEARCHING_OBJECT:
                 # Attempt object detection immediately on first frame (counter=0), then every 15 frames
-                if self._search_frame_counter == 0 or self._search_frame_counter >= self._search_interval:
-                    print(f"🔍 Attempting object detection...")
-                    self._search_frame_counter = 0  # Reset counter after detection attempt
+                if self._should_attempt_detection("object"):
                     # Increment search attempt counter and check for timeout
                     if self.tracking_state_machine.increment_search_attempt():
                         detection_success = self._attempt_object_detection(frame_bgr)
-                        if not detection_success:
-                            # Increment counter if detection failed (to retry in 15 frames)
-                            self._search_frame_counter += 1
-                        else:
-                            # Increment counter if detection succeeded (to avoid immediate retry)
-                            self._search_frame_counter += 1
+                        # Counter is already handled by _should_attempt_detection()
                     else:
                         print("🔍 Search timeout reached, stopping attempts")
-                else:
-                    # Count frames between detection attempts
-                    self._search_frame_counter += 1
             else:
                 print(f"✅ State transitioned to {current_state_after_sam2.value}, stopping object search")
         
@@ -622,22 +615,16 @@ class GSAM2Wrapper:
         
         if not self._sam2_primed:
             # Attempt hand detection immediately on first frame (counter=0), then every 15 frames  
-            if self._search_frame_counter == 0 or self._search_frame_counter >= self._search_interval:
-                print(f"🤚 Attempting hand detection...")
-                self._search_frame_counter = 0  # Reset counter after detection attempt
-                
+            if self._should_attempt_detection("hand"):
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 if self.start_hand_tracking(frame_rgb):
-                    # Increment counter if detection succeeded (to avoid immediate retry)
-                    self._search_frame_counter += 1
+                    # Counter is already handled by _should_attempt_detection()
                     return self._track_with_sam2(frame_bgr, depth_img)
                 else:
-                    # Increment counter if detection failed (to retry in 15 frames)
-                    self._search_frame_counter += 1
+                    # Counter is already handled by _should_attempt_detection()
                     return []
             else:
-                # Count frames between detection attempts
-                self._search_frame_counter += 1
+                # Counter is already handled by _should_attempt_detection()
                 return []
         else:
             # SAM-2 is primed, continue tracking
