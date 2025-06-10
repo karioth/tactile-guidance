@@ -218,23 +218,23 @@ class TaskController(AutoAssign):
 
         # Hand detector only required for YOLO backend
         if self.backend == "yolo":
-        print("Loading hand detector …")
+            print("Loading hand detector …")
 
-        hand_weights = Path(self.weights_hand)
-        if not hand_weights.is_file():
-            # allow relative filenames like 'hand.pt' – resolve to aibox directory
-            candidate = Path(__file__).resolve().parent / hand_weights.name
-            if candidate.is_file():
-                hand_weights = candidate
-            else:
-                raise FileNotFoundError(f"Hand-detector weights not found: {self.weights_hand}")
+            hand_weights = Path(self.weights_hand)
+            if not hand_weights.is_file():
+                # allow relative filenames like 'hand.pt' – resolve to aibox directory
+                candidate = Path(__file__).resolve().parent / hand_weights.name
+                if candidate.is_file():
+                    hand_weights = candidate
+                else:
+                    raise FileNotFoundError(f"Hand-detector weights not found: {self.weights_hand}")
 
-        self.model_hand = DetectMultiBackend(str(hand_weights), device=self.device, dnn=self.dnn, fp16=self.half)
-        self.stride_hand, self.names_hand, self.pt_hand = (
-            self.model_hand.stride,
-            self.model_hand.names,
-            self.model_hand.pt,
-        )
+            self.model_hand = DetectMultiBackend(str(hand_weights), device=self.device, dnn=self.dnn, fp16=self.half)
+            self.stride_hand, self.names_hand, self.pt_hand = (
+                self.model_hand.stride,
+                self.model_hand.names,
+                self.model_hand.pt,
+            )
         else:  # gsam2 path → skip hand YOLO, use multi-prompt GDINO
             self.model_hand = None
             handedness = getattr(self, 'handedness', 'right')
@@ -291,7 +291,7 @@ class TaskController(AutoAssign):
         if type == 'detector':
             #model.warmup(imgsz=(1 if self.pt_obj or self.model_obj.triton else self.bs, 3, *self.imgsz))
             if self.model_hand is not None:  # Only warmup if hand model is loaded
-            model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
+                model.warmup(imgsz=(1 if self.pt_hand or self.model_hand.triton else self.bs, 3, *self.imgsz))
         
         if type == 'tracker':
             model.warmup()
@@ -533,17 +533,13 @@ class TaskController(AutoAssign):
 
             # Image pre-processing
             if self.backend == "gsam2":
-                # Multi-prompt detection via Grounding-DINO (object + hands)
+                # **OPTIMIZED GSAM2 PATH**: Skip YOLO preprocessing entirely
+                # GSAM2 wrapper handles all detection internally, no tensor preprocessing needed
                 outputs = self.gsam2.track(im0)  # Returns list[ndarray] with both objects and hands
-
-                # Placeholders required by later branches (not used in GSAM2 path)
-                xywhs = torch.empty(0, 4)
-                confs = torch.empty(0)
-                clss = torch.empty(0)
-
-                # Disable StrongSORT tracker in GSAM-2 backend for now
-                self.run_object_tracker = False
-
+                
+                # Skip all YOLO-specific processing and jump to depth estimation
+                # No need for: tensor allocation, YOLO inference, NMS, hand detection, tracking updates
+                
             else:
                 # ------------------------------------------------------------
                 # Original YOLOv5 + StrongSORT path
@@ -583,18 +579,17 @@ class TaskController(AutoAssign):
                     max_det=self.max_det,
                 )
 
-            # Fix hand class IDs for YOLO backend only
-            if self.backend == "yolo":
-            for hand in pred_hand[0]:
-                if len(hand):
-                    hand[5] += index_add  # assign correct classID by adding len(coco_labels)
+                # Fix hand class IDs for YOLO backend only
+                for hand in pred_hand[0]:
+                    if len(hand):
+                        hand[5] += index_add  # assign correct classID by adding len(coco_labels)
 
-            # Camera motion compensation for tracker (ECC)
-            if self.run_object_tracker:
+            # Camera motion compensation for tracker (ECC) - YOLO only
+            if self.run_object_tracker and self.backend == "yolo":
                 curr_frames = im0
                 self.tracker.tracker.camera_update(prev_frames, curr_frames)
             
-            # Initialize/clear detections (YOLO path)
+            # Initialize/clear detections (YOLO path only)
             if self.backend == "yolo":
                 xywhs = torch.empty(0, 4)
                 confs = torch.empty(0)
@@ -608,8 +603,8 @@ class TaskController(AutoAssign):
                     confs = preds[:, 4]
                     clss = preds[:, 5]
 
-            # Generate tracker outputs for navigation
-            if self.run_object_tracker:
+            # Generate tracker outputs for navigation (YOLO only)
+            if self.run_object_tracker and self.backend == "yolo":
                 
                 # Update previous information
                 outputs = self.tracker.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0) # (x, y, x, y, track_id, cls, conf)
@@ -619,41 +614,36 @@ class TaskController(AutoAssign):
                     hand_index_list = [hand + index_add for hand in self.classes_hand]
                     outputs = [output for output in outputs if output[5] in self.classes_obj + hand_index_list]
 
-            else:  # without tracking
+            elif self.backend == "yolo":  # YOLO without tracking
+                outputs = np.array(preds.cpu())  # (x, y, x, y, conf, cls)
+                outputs = np.insert(outputs, 4, -1, axis=1)  # insert track_id placeholder
+                outputs[:, [5, 6]] = outputs[:, [6, 5]]  # switch cls and conf -> (x, y, x, y, track_id, cls, conf)
+                
+                # Convert xyxy to xywh (YOLO backend only)
+                outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
+                
+                # Add depth placeholder to outputs (YOLO backend only)
+                outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
+            
+            # For GSAM2: outputs already in correct format from gsam2.track() - no conversion needed
 
-                if self.backend == "yolo":
-                    outputs = np.array(preds.cpu())  # (x, y, x, y, conf, cls)
-                    outputs = np.insert(outputs, 4, -1, axis=1)  # insert track_id placeholder
-                    outputs[:, [5, 6]] = outputs[:, [6, 5]]  # switch cls and conf -> (x, y, x, y, track_id, cls, conf)
-                else:
-                    # GSAM2 path: outputs already produced and combined earlier
-                    outputs = np.array(outputs)
-
-            # Convert xyxy to xywh (only for YOLO backend, GSAM2 already in correct format)
+            # **OPTIMIZED**: Skip motion detection for GSAM2 (SAM-2 handles temporal consistency)
             if self.backend == "yolo":
-            outputs = [np.concatenate((xyxy2xywh(bb[:4]), bb[4:])) for bb in outputs] # (x, y, w, h, track_id, cls, conf)
+                # Calculate difference between current and previous frame (YOLO only)
+                if prev_frames is not None:
+                    img_gr_1, img_gr_2 = cv2.cvtColor(curr_frames, cv2.COLOR_BGR2GRAY), cv2.cvtColor(prev_frames, cv2.COLOR_BGR2GRAY)
+                    diff = cv2.absdiff(img_gr_1, img_gr_2)
+                    mean_diff = np.mean(diff)
+                    std_diff = np.std(diff)
+                    if mean_diff > 30: # Big change between frames
+                        outputs = []
 
-            # Add depth placeholder to outputs (only for YOLO backend, GSAM2 already has it)
-            if self.backend == "yolo":
-            outputs = [np.append(bb, -1) for bb in outputs] # (x, y, w, h, track_id, conf, cls, depth)
-
-            # Calculate difference between current and previous frame
-            if prev_frames is not None:
-                img_gr_1, img_gr_2 = cv2.cvtColor(curr_frames, cv2.COLOR_BGR2GRAY), cv2.cvtColor(prev_frames, cv2.COLOR_BGR2GRAY)
-                diff = cv2.absdiff(img_gr_1, img_gr_2)
-                mean_diff = np.mean(diff)
-                std_diff = np.std(diff)
-                if mean_diff > 30: # Big change between frames
-                    outputs = []
-
-            # Depth estimation (automatically skips revived bbs)
-            #depth_img, outputs = self.get_depth(im0, self.transform, self.device, self.model, self.depth_estimator, self.net_w, self.net_h, vis=False, bbs=outputs) if self.run_depth_estimator else (None, outputs)
-            #depth_img, outputs = self.get_depth(im0, frame, outputs, prev_outputs, 10) if self.run_depth_estimator else (None, outputs)
-
+            # **OPTIMIZED**: Reduced depth estimation frequency for GSAM2 (every 20 frames vs 10)
             if not self.run_depth_estimator:
                 depth_img = None
             else:
-                if frame % 10 == 0: # for effiency we are only predicting depth every 10th frame
+                depth_interval = 20 if self.backend == "gsam2" else 10
+                if frame % depth_interval == 0: # Less frequent depth prediction for GSAM2
                     depth_img, _ = self.depth_estimator.predict_depth(im0)
                     outputs = bbs_to_depth(im0, depth_img, outputs)
                 else:
@@ -723,22 +713,27 @@ class TaskController(AutoAssign):
 
             # VISUALIZATIONS
 
-            # Write results
+            # **OPTIMIZED**: Pre-convert coordinates to avoid repeated conversions in visualization loop
+            visualization_data = []
             for detection in outputs:
                 if len(detection) >= 8:  # Ensure we have a complete Detection tuple
                     xc, yc, w, h, track_id, cls, conf, depth = detection
-                    # Convert center-based to corner-based coordinates
+                    # Convert center-based to corner-based coordinates once
                     xyxy = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
                     id, cls = int(track_id), int(cls)
+                    visualization_data.append((xyxy, id, cls, conf, depth))
+
+            # Write results (optimized loop)
+            for xyxy, id, cls, conf, depth in visualization_data:
                 if save_img or self.save_crop or self.view_img:
                     label = None if self.hide_labels else (f'ID: {id} {self.master_label[cls]}' if self.hide_conf else (f'ID: {id} {self.master_label[cls]} {conf:.2f} {depth:.2f}'))
                     annotator.box_label(xyxy, label, color=colors(cls, True))
 
-            # Target BB
+            # Target BB (optimized)
             if curr_target is not None:
                 if len(curr_target) >= 8:  # Ensure we have a complete Detection tuple
                     xc, yc, w, h, track_id, cls, conf, depth = curr_target
-                    # Convert center-based to corner-based coordinates  
+                    # Convert center-based to corner-based coordinates once 
                     xyxy = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
                     if save_img or self.save_crop or self.view_img:
                         label = None if self.hide_labels else 'Target object'
@@ -892,7 +887,7 @@ class TaskController(AutoAssign):
         # Warmup models
         #self.warmup_model(self.model_obj)
         if self.model_hand is not None:  # Only warmup hand model if it exists
-        self.warmup_model(self.model_hand)
+            self.warmup_model(self.model_hand)
         if self.run_object_tracker:
             self.warmup_model(self.tracker.model,'tracker')
 
