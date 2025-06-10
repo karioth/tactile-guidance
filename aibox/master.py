@@ -198,9 +198,20 @@ if __name__ == '__main__':
             handedness=args.handedness)
         
         task_controller.run()
+        
+        # Print performance summary for GSAM2 backend
+        if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
+            task_controller.gsam2.print_performance_summary()
 
     except KeyboardInterrupt:
+        # Print performance summary even on interruption for GSAM2 backend
+        if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
+            task_controller.gsam2.print_performance_summary()
         controller.close_app(belt_controller)
 
+    # Print final performance summary for GSAM2 backend
+    if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
+        task_controller.gsam2.print_performance_summary()
+        
     # In the end, close all processes
     controller.close_app(belt_controller)

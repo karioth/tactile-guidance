@@ -47,14 +47,13 @@ class TrackingState(Enum):
     HAND_READY = "hand_ready"                   # Hand found, ready for object prompt  
     SEARCHING_OBJECT = "searching_object"       # Hand tracked, searching for object
     TRACKING_BOTH = "tracking_both"             # Both hand and object tracked
-    RECOVERY = "recovery"                       # Lost tracking, attempting recovery
 
 
 class SimpleLossTracker:
     """Simple tracking loss detection - only what we actually use."""
     
-    def __init__(self, max_loss_frames: int = 8):
-        self.max_loss_frames = max_loss_frames  # Consider lost after 8 consecutive missed frames (~0.3s at 30fps)
+    def __init__(self, max_loss_frames: int = 20):
+        self.max_loss_frames = max_loss_frames  # Consider lost after 20 consecutive missed frames (~0.67s at 30fps) - increased from 8 for SAM-2's better temporal tracking
         self.object_loss_frames = 0
         self.hand_loss_frames = 0
         
@@ -96,24 +95,17 @@ class SimpleLossTracker:
 
 
 class TrackingStateMachine:
-    """Simplified state machine - only essential states and transitions."""
+    """Hand-first state machine for SAM-2 tracking workflow."""
     
-    def __init__(self, loss_tracker: SimpleLossTracker, hand_first_mode: bool = True):
-        self.hand_first_mode = hand_first_mode
+    def __init__(self, loss_tracker: SimpleLossTracker):
         self.loss_tracker = loss_tracker
-        
-        # **SIMPLIFIED: Only two initial states**
-        if hand_first_mode:
-            self.state = TrackingState.WAITING_FOR_HAND
-        else:
-            self.state = TrackingState.TRACKING_BOTH  # Legacy mode starts in tracking
-            
+        self.state = TrackingState.WAITING_FOR_HAND
         self.state_entry_time = time.time()
         self.object_search_attempts = 0
         self.max_object_search_attempts = 10  # ~5s at 30fps
         
     def update_state(self, has_object: bool, has_hand: bool) -> TrackingState:
-        """Simplified state machine with only essential transitions."""
+        """Hand-first state machine with essential transitions."""
         object_lost = self.loss_tracker.is_object_lost()
         hand_lost = self.loss_tracker.is_hand_lost()
         
@@ -138,14 +130,6 @@ class TrackingStateMachine:
                 self._transition_to(TrackingState.WAITING_FOR_HAND)
             elif object_lost:
                 self._transition_to(TrackingState.HAND_READY)
-        
-        elif self.state == TrackingState.RECOVERY:
-            if has_hand and has_object:
-                self._transition_to(TrackingState.TRACKING_BOTH)
-            elif has_hand:
-                self._transition_to(TrackingState.HAND_READY)
-            else:
-                self._transition_to(TrackingState.WAITING_FOR_HAND)
         
         return self.state
     
@@ -192,29 +176,23 @@ class TrackingStateMachine:
     
     def reset(self) -> None:
         """Reset to initial state."""
-        if self.hand_first_mode:
-            self.state = TrackingState.WAITING_FOR_HAND
-        else:
-            self.state = TrackingState.TRACKING_BOTH
-            
+        self.state = TrackingState.WAITING_FOR_HAND
         self.state_entry_time = time.time()
-        self.object_search_attempts = 0
 
 
 class GSAM2Wrapper:
-    """A *minimal* wrapper that exposes a YOLO-compatible interface
+    """Hand-first wrapper that exposes a YOLO-compatible interface
     around Grounding-DINO + SAM-2 tracking.
 
-    Uses Grounding-DINO for initial object detection and SAM-2 for 
-    temporal tracking with mask propagation. DINO is only used for
-    detection/re-priming - never as a per-frame fallback tracker.
-    Converts masks back to bounding boxes to maintain compatibility 
-    with bracelet navigation.
+    Uses a hand-first workflow: detects and tracks the user's hand first,
+    then accepts object prompts to search for and track objects.
+    Uses Grounding-DINO for initial detection and SAM-2 for 
+    temporal tracking with mask propagation.
 
     Public API
     ----------
     set_prompt(frame_rgb, text)
-        Initialize SAM-2 tracking with first detection from text prompt.
+        Set object prompt for hand-first workflow.
     track(frame_rgb, depth_img=None) -> list[tuple]
         Return detection tuples in the format required by `bracelet.py`::
 
@@ -248,22 +226,36 @@ class GSAM2Wrapper:
         default_prompt: str = "coffee cup",
         handedness: str = "right",
         frame_cache_limit: int = 100,  # Reset every 100 frames (~3.3s at 30fps) - reduced from 300 for better performance
-        memory_monitoring: bool = True,
-        hand_first_mode: bool = True,  # New: Enable hand-first workflow
     ) -> None:
-        self.device = (
-            torch.device(device)
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        """Initialize GSAM2Wrapper with hand-first workflow.
+
+        Parameters
+        ----------
+        device : str | torch.device | None
+            Device for PyTorch model inference. If None, auto-detected.
+        box_threshold : float
+            Box detection threshold for Grounding-DINO (default: 0.35).
+        text_threshold : float
+            Text threshold for Grounding-DINO (default: 0.25).
+        default_prompt : str
+            Default object prompt for detection.
+        handedness : str
+            User handedness - "left" or "right" (default: "right").
+        frame_cache_limit : int
+            Maximum frames cached by SAM-2 before memory reset (default: 100).
+        """
+        # Device detection
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
         self.handedness = handedness
         self.frame_cache_limit = frame_cache_limit
-        self.memory_monitoring = memory_monitoring
-        self.hand_first_mode = hand_first_mode
 
-        # Load Grounding-DINO for detection
+        # Initialize Grounding-DINO 
         self._gdino = GDINOModel(
             model_config_path=str(self._CONF_PATH),
             model_checkpoint_path=str(self._CKPT_PATH),
@@ -275,22 +267,6 @@ class GSAM2Wrapper:
         grounded_sam2_dir = Path(__file__).resolve().parent.parent / "Grounded-SAM-2"
         original_cwd = os.getcwd()
         os.chdir(str(grounded_sam2_dir))
-        
-        # **DEBUG: Check SAM-2 attention backend settings**
-        old_gpu, use_flash_attn, math_kernel_on = get_sdpa_settings()
-        print(f"🔧 SAM-2 Attention Backend Settings:")
-        
-        if torch.cuda.is_available():
-            gpu_props = torch.cuda.get_device_properties(0)
-            print(f"   - GPU Compute Capability: {gpu_props.major}.{gpu_props.minor}")
-            print(f"   - GPU Name: {gpu_props.name}")
-        else:
-            print(f"   - GPU: Not available (CPU mode)")
-            
-        print(f"   - Flash Attention Enabled: {use_flash_attn}")
-        print(f"   - Math Kernel Enabled: {math_kernel_on}")
-        print(f"   - Old GPU Mode: {old_gpu}")
-        print(f"   - PyTorch Version: {torch.__version__}")
         
         try:
             self._sam2_video = build_sam2_video_predictor(
@@ -316,7 +292,7 @@ class GSAM2Wrapper:
 
         # Initialize loss tracker
         self.loss_tracker = SimpleLossTracker()
-        self.tracking_state_machine = TrackingStateMachine(self.loss_tracker, hand_first_mode)
+        self.tracking_state_machine = TrackingStateMachine(self.loss_tracker)
 
         # Initialize tracking state
         self._sam2_primed = False
@@ -334,14 +310,17 @@ class GSAM2Wrapper:
         self._last_hand_box = None
         self._last_object_box = None
 
+        # Simple performance tracking
+        self._total_frames_processed = 0
+        self._start_time = time.time()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def set_prompt(self, frame_rgb: np.ndarray | None, text: str) -> None:
-        """(Re)sets the text prompt and handles SAM-2 tracking transitions.
+        """Set object prompt for hand-first workflow.
         
-        For hand-first workflow, this is equivalent to set_object_prompt().
-        For legacy workflow, performs full initialization or mid-tracking changes.
+        This is equivalent to set_object_prompt() for hand-first workflow.
 
         Parameters
         ----------
@@ -352,247 +331,60 @@ class GSAM2Wrapper:
             The free-form text prompt (e.g. "red bottle").
         """
         
-        # Handle hand-first workflow
-        if self.hand_first_mode:
-            if frame_rgb is None:
-                # Just update the prompt
-                self._prompt = text
-                print(f"🔄 Object prompt updated: '{text}' (no frame provided)")
-                return
-            
-            # If hand not initialized, start hand tracking first
-            if not self._hand_initialized:
-                print("🤚 Starting hand tracking first...")
-                self.start_hand_tracking(frame_rgb)
-                # Set the object prompt for later
-                self._prompt = text
-                self._object_prompt_provided = True
-                return
-            
-            # If ready for object prompt, start object search
-            if self.is_ready_for_object_prompt():
-                self.set_object_prompt(text)
-                return
-            
-            # Otherwise just update the prompt
-            self._prompt = text
-            print(f"🔄 Object prompt updated: '{text}'")
-            return
-        
-        # Legacy workflow (existing behavior)
-        old_prompt = self._prompt
-        self._prompt = text
-        
-        # If no frame provided, just update the prompt
         if frame_rgb is None:
-            print(f"🔄 Prompt updated: '{old_prompt}' → '{text}' (no frame provided)")
+            # Just update the prompt
+            self._prompt = text
+            print(f"🔄 Object prompt updated: '{text}' (no frame provided)")
             return
         
-        # Check if this is a mid-tracking prompt change (SAM-2 already primed)
-        if self._sam2_primed and old_prompt != text:
-            print(f"🔄 Mid-tracking prompt change: '{old_prompt}' → '{text}'")
-            self._handle_prompt_change_during_tracking(frame_rgb)
-        else:
-            # Initial setup or same prompt - do full initialization
-            if not self._sam2_primed:
-                print(f"🎯 Initial SAM-2 setup with prompt: '{text}'")
-            
-            # Reset SAM-2 inference state for new prompt
-            self._inference_state = self._sam2_video.init_state(video_path=None)
-            self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-            self._frame_count = 0
-
-            # Reset loss tracker and state machine
-            self.loss_tracker.reset()
-            self.tracking_state_machine.reset()
-            
-            # Initialize tracking state
-            self._sam2_primed = False
-            self._tracked_object_id = None
-            self._tracked_hand_id = None
-            
-            # **NEW: Reset frame counters on prompt change**
-            self._search_frame_counter = 0
-            
-            # Perform initial detection and priming
-            self._prime_sam2_with_detection(frame_rgb)
-    
-    def _handle_prompt_change_during_tracking(self, frame_rgb: np.ndarray) -> None:
-        """Handle prompt changes during active tracking by preserving hand tracking.
+        # If hand not initialized, start hand tracking first
+        if not self._hand_initialized:
+            print("🤚 Starting hand tracking first...")
+            self.start_hand_tracking(frame_rgb)
+            # Set the object prompt for later
+            self._prompt = text
+            self._object_prompt_provided = True
+            return
         
-        Strategy:
-        1. Extract current hand mask from SAM-2 if being tracked
-        2. Detect new object with Grounding-DINO
-        3. Re-prime SAM-2 with preserved hand + new object
+        # If ready for object prompt, start object search
+        if self.is_ready_for_object_prompt():
+            self.set_object_prompt(text)
+            return
+        
+        # Otherwise just update the prompt
+        self._prompt = text
+        print(f"🔄 Object prompt updated: '{text}'")
+    
+    def _detect_and_prime_sam2(self, frame_rgb: np.ndarray, prompt: str, 
+                              target_types: List[str] = ["object", "hand"],
+                              reset_state: bool = False, 
+                              preserve_existing: Optional[List[str]] = None) -> bool:
+        """Unified detection and SAM-2 priming logic.
         
         Args:
-            frame_rgb: Current RGB frame for new object detection
-        """
-        try:
-            # Step 1: Preserve current hand tracking if exists
-            preserved_hand_mask = None
-            preserved_hand_box = None
-            
-            if self._tracked_hand_id is not None:
-                # Get current hand mask from SAM-2
-                try:
-                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                    sam2_detections = self._track_with_sam2(frame_bgr, None)
-                    
-                    # Find current hand detection
-                    for det in sam2_detections:
-                        if len(det) >= 6 and det[5] == 1:  # class_id=1 for hand
-                            xc, yc, w, h = det[:4]
-                            preserved_hand_box = np.array([xc - w/2, yc - h/2, xc + w/2, yc + h/2])
-                            print(f"🤚 Preserving hand tracking: box={preserved_hand_box}")
-                            break
-                            
-                except Exception as e:
-                    print(f"⚠️  Could not preserve hand tracking: {e}")
-            
-            # Step 2: Detect new object with Grounding-DINO
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            
-            # Only detect the new object (not hand, since we're preserving it)
-            detections, labels = self._call_gdino_with_tracking(
-                frame_bgr=frame_bgr,
-                caption=self._prompt,  # Only new object prompt
-                call_type="object"
-            )
-            
-            if len(detections.xyxy) == 0:
-                print(f"⚠️  No objects detected for new prompt: '{self._prompt}'")
-                return
-            
-            # Select best object candidate
-            object_candidates = []
-            for i in range(len(detections.xyxy)):
-                x1, y1, x2, y2 = detections.xyxy[i]
-                conf = float(detections.confidence[i])
-                label = labels[i].lower() if i < len(labels) else ""
-                object_candidates.append((x1, y1, x2, y2, conf, label))
-            
-            best_object = self._select_best_candidate(object_candidates, "object")
-            if best_object is None:
-                print(f"⚠️  No suitable objects found for prompt: '{self._prompt}'")
-                return
-            
-            # Step 3: Reset SAM-2 and re-prime with preserved hand + new object
-            self._inference_state = self._sam2_video.init_state(video_path=None)
-            self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-            self._frame_count = 0
-            
-            # Set video dimensions
-            self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-            
-            # Add current frame to SAM-2
-            frame_idx = self._sam2_video.add_new_frame(self._inference_state, frame_rgb)
-            
-            # Prime with new object
-            x1, y1, x2, y2, conf, label = best_object
-            object_box = np.array([x1, y1, x2, y2])
-            
-            self._tracked_object_id = 1  # Object gets ID 1
-            _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                inference_state=self._inference_state,
-                frame_idx=frame_idx,
-                obj_id=self._tracked_object_id,
-                box=object_box,
-            )
-            print(f"🎯 Re-primed SAM-2 with new object '{label}' (ID: {self._tracked_object_id}, conf: {conf:.3f})")
-            
-            # Prime with preserved hand if available
-            if preserved_hand_box is not None:
-                self._tracked_hand_id = 2  # Hand gets ID 2
-                _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_hand_id,
-                    box=preserved_hand_box,
-                )
-                print(f"🤚 Re-primed SAM-2 with preserved hand (ID: {self._tracked_hand_id})")
-            else:
-                # Try to detect hand if not preserved
-                hand_prompt = f"my {self.handedness} hand"
-                hand_detections, hand_labels = self._call_gdino_with_tracking(
-                    frame_bgr=frame_bgr,
-                    caption=hand_prompt,
-                    call_type="hand"
-                )
-                
-                if len(hand_detections.xyxy) > 0:
-                    # Find best hand candidate
-                    hand_candidates = []
-                    for i in range(len(hand_detections.xyxy)):
-                        x1, y1, x2, y2 = hand_detections.xyxy[i]
-                        conf = float(hand_detections.confidence[i])
-                        label = hand_labels[i].lower() if i < len(hand_labels) else ""
-                        if "hand" in label:
-                            hand_candidates.append((x1, y1, x2, y2, conf, label))
-                    
-                    best_hand = self._select_best_candidate(hand_candidates, "hand")
-                    if best_hand is not None:
-                        x1, y1, x2, y2, conf, label = best_hand
-                        hand_box = np.array([x1, y1, x2, y2])
-                        
-                        self._tracked_hand_id = 2
-                        _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                            inference_state=self._inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=self._tracked_hand_id,
-                            box=hand_box,
-                        )
-                        print(f"🤚 Re-detected and primed hand '{label}' (ID: {self._tracked_hand_id}, conf: {conf:.3f})")
-            
-            self._frame_count = frame_idx + 1
-            print(f"✅ Prompt change completed successfully")
-            
-            # Reset loss tracker but keep state machine in tracking mode
-            self.loss_tracker.reset()
-            # Don't reset state machine - we want to continue tracking
-            
-        except Exception as e:
-            print(f"❌ Prompt change failed: {e}")
-            # Fallback to full re-initialization
-            print("🔄 Falling back to full re-initialization...")
-            self._inference_state = self._sam2_video.init_state(video_path=None)
-            self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-            self._frame_count = 0
-            self.loss_tracker.reset()
-            self.tracking_state_machine.reset()
-            self._sam2_primed = False
-            self._tracked_object_id = None
-            self._tracked_hand_id = None
-            self._prime_sam2_with_detection(frame_rgb)
-    
-    def _prime_sam2_with_detection(self, frame_rgb: np.ndarray) -> bool:
-        """Prime SAM-2 with object and hand detection from first frame.
-        
-        Args:
-            frame_rgb: RGB frame for object detection
+            frame_rgb: RGB frame for detection
+            prompt: Text prompt for Grounding-DINO
+            target_types: List of target types to detect ["object", "hand"]
+            reset_state: Whether to reset SAM-2 state before adding
+            preserve_existing: List of existing targets to preserve during reset ["hand", "object"]
             
         Returns:
-            bool: True if priming successful, False otherwise
+            bool: True if detection and priming successful
         """
         try:
             # Convert RGB to BGR for Grounding-DINO
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # Multi-prompt: detect both target object and hand
-            multi_prompt = f"{self._prompt}. my {self.handedness} hand"
-            
-            # Grounding-DINO detection for both object and hand
+            # Call Grounding-DINO
             detections, labels = self._call_gdino_with_tracking(
                 frame_bgr=frame_bgr,
-                caption=multi_prompt,
-                call_type="recovery"
+                caption=prompt,
             )
             
             if len(detections.xyxy) == 0:
-                print(f"⚠️  No objects detected for prompt: '{multi_prompt}'")
                 return False
             
-            # Separate object and hand detections
+            # Parse detections based on target types
             object_candidates = []
             hand_candidates = []
             
@@ -603,27 +395,67 @@ class GSAM2Wrapper:
                 
                 detection_data = (x1, y1, x2, y2, conf, label)
                 
-                if "hand" in label:
+                if "hand" in label and "hand" in target_types:
                     hand_candidates.append(detection_data)
-                else:
+                elif "object" in target_types and "hand" not in label:
                     object_candidates.append(detection_data)
             
             # Select best candidates
-            best_object = self._select_best_candidate(object_candidates, "object")
-            best_hand = self._select_best_candidate(hand_candidates, "hand")
+            best_object = None
+            best_hand = None
             
-            if best_object is None and best_hand is None:
-                print(f"⚠️  No suitable objects found for prompt: '{multi_prompt}'")
+            if "object" in target_types:
+                best_object = self._select_best_candidate(object_candidates)
+            if "hand" in target_types:
+                best_hand = self._select_best_candidate(hand_candidates)
+            
+            # Check if we found required targets
+            if "object" in target_types and best_object is None and "hand" in target_types and best_hand is None:
+                return False
+            if "object" in target_types and len(target_types) == 1 and best_object is None:
+                return False
+            if "hand" in target_types and len(target_types) == 1 and best_hand is None:
                 return False
             
-            # **CRITICAL**: Set video dimensions in inference state FIRST
-            self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
+            # Handle SAM-2 state management
+            if reset_state:
+                # Reset state and preserve existing targets
+                preserved_boxes = {}
+                if preserve_existing:
+                    if "hand" in preserve_existing and hasattr(self, '_last_hand_box') and self._last_hand_box is not None:
+                        preserved_boxes["hand"] = self._last_hand_box.copy()
+                    if "object" in preserve_existing and hasattr(self, '_last_object_box') and self._last_object_box is not None:
+                        preserved_boxes["object"] = self._last_object_box.copy()
+                
+                # Reset SAM-2 state
+                self._sam2_video.reset_state(self._inference_state)
+                frame_idx = self._sam2_video.add_new_frame(self._inference_state, frame_rgb)
+                
+                # Re-add preserved targets first
+                for target_type, box in preserved_boxes.items():
+                    if target_type == "hand":
+                        self._tracked_hand_id = 2
+                        self._sam2_video.add_new_points_or_box(
+                            inference_state=self._inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=self._tracked_hand_id,
+                            box=box,
+                        )
+                    elif target_type == "object":
+                        self._tracked_object_id = 1
+                        self._sam2_video.add_new_points_or_box(
+                            inference_state=self._inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=self._tracked_object_id,
+                            box=box,
+                        )
+            else:
+                # Normal state management
+                self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
+                frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
             
-            # Add RGB frame to SAM-2 inference state
-            frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-            
-            # Prime SAM-2 with detected objects
-            primed_objects = []
+            # Add newly detected targets
+            success_count = 0
             
             if best_object is not None:
                 x1, y1, x2, y2, conf, label = best_object
@@ -631,16 +463,15 @@ class GSAM2Wrapper:
                 
                 self._tracked_object_id = 1  # Object gets ID 1
                 
-                print(f"🔧 SAM-2 Re-priming: Adding object box with attention backend")
-                _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
+                self._sam2_video.add_new_points_or_box(
                     inference_state=self._inference_state,
                     frame_idx=frame_idx,
                     obj_id=self._tracked_object_id,
                     box=object_box,
                 )
                 
-                primed_objects.append(f"object '{label}' (ID: {self._tracked_object_id}, conf: {conf:.3f})")
-                print(f"🎯 Primed SAM-2 with {primed_objects[-1]}")
+                self._last_object_box = object_box.copy()
+                success_count += 1
             
             if best_hand is not None:
                 x1, y1, x2, y2, conf, label = best_hand
@@ -648,27 +479,43 @@ class GSAM2Wrapper:
                 
                 self._tracked_hand_id = 2  # Hand gets ID 2
                 
-                print(f"🔧 SAM-2 Re-priming: Adding hand box with attention backend")
-                _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
+                self._sam2_video.add_new_points_or_box(
                     inference_state=self._inference_state,
                     frame_idx=frame_idx,
                     obj_id=self._tracked_hand_id,
                     box=hand_box,
                 )
                 
-                primed_objects.append(f"hand '{label}' (ID: {self._tracked_hand_id}, conf: {conf:.3f})")
-                print(f"🤚 Primed SAM-2 with {primed_objects[-1]}")
+                self._last_hand_box = hand_box.copy()
+                success_count += 1
             
+            # Update state
             self._sam2_primed = True
             self._frame_count = frame_idx + 1
-            print(f"✅ SAM-2 primed successfully with {len(primed_objects)} objects at frame {frame_idx}")
-            return True
+            
+            return success_count > 0
             
         except Exception as e:
-            print(f"❌ SAM-2 priming failed: {e}")
+            print(f"❌ Unified detection failed: {e}")
             return False
-    
-    def _select_best_candidate(self, candidates: List[tuple], candidate_type: str) -> Optional[tuple]:
+
+    def _prime_sam2_with_detection(self, frame_rgb: np.ndarray) -> bool:
+        """Prime SAM-2 with object and hand detection from first frame."""
+        multi_prompt = f"{self._prompt}. my {self.handedness} hand"
+        return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
+
+    def _prime_sam2_detection_logic(self, frame_rgb: np.ndarray, operation_type: str) -> bool:
+        """Shared logic for SAM-2 priming and recovery operations."""
+        multi_prompt = f"{self._prompt}. my {self.handedness} hand"
+        
+        if operation_type == "recovery":
+            # For recovery, we need to handle state management differently
+            return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
+        else:
+            # For priming, normal flow
+            return self._detect_and_prime_sam2(frame_rgb, multi_prompt, ["object", "hand"])
+
+    def _select_best_candidate(self, candidates: List[tuple]) -> Optional[tuple]:
         """Simplified candidate selection - just pick highest confidence."""
         if not candidates:
             return None
@@ -678,13 +525,12 @@ class GSAM2Wrapper:
         
         return best_candidate
 
-    def _call_gdino_with_tracking(self, frame_bgr: np.ndarray, caption: str, call_type: str = "unknown") -> tuple:
-        """Call GDINO with usage tracking for efficiency analysis.
+    def _call_gdino_with_tracking(self, frame_bgr: np.ndarray, caption: str) -> tuple:
+        """Call GDINO for object detection.
         
         Args:
             frame_bgr: BGR frame for detection
             caption: Text prompt for detection
-            call_type: Type of call ("hand", "object", "multi") for tracking
             
         Returns:
             tuple: (detections, labels) from GDINO
@@ -704,7 +550,7 @@ class GSAM2Wrapper:
         frame_bgr: np.ndarray,
         depth_img: Optional[np.ndarray] = None,
     ) -> List[np.ndarray]:
-        """Simplified tracking that handles both hand-first and legacy workflows.
+        """Hand-first tracking using SAM-2 temporal tracking.
 
         Returns
         -------
@@ -712,6 +558,9 @@ class GSAM2Wrapper:
             List of detection tuples: [xc, yc, w, h, track_id, class_id, conf, depth]
             class_id: 0 = target object, 1 = hand
         """
+        # Count every frame processed (including skipped ones)
+        self._total_frames_processed += 1
+        
         current_state = self.tracking_state_machine.state
         
         # **SIMPLIFIED: Handle based on current state, not workflow mode**
@@ -761,14 +610,6 @@ class GSAM2Wrapper:
         
         elif current_state == TrackingState.TRACKING_BOTH:
             results = self._track_with_sam2(frame_bgr, depth_img)
-        
-        elif current_state == TrackingState.RECOVERY:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            if self._attempt_sam2_recovery(frame_rgb):
-                results = self._track_with_sam2(frame_bgr, depth_img)
-            else:
-                self.tracking_state_machine._transition_to(TrackingState.WAITING_FOR_HAND)
-                results = []
         
         else:
             # Fallback
@@ -909,32 +750,10 @@ class GSAM2Wrapper:
             
         except Exception as e:
             print(f"⚠️  SAM-2 tracking failed: {e}")
-            # Attempt recovery instead of falling back to DINO every frame
-            # This preserves the efficiency benefits of SAM-2 vs DINO-per-frame
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            if self._attempt_sam2_recovery(frame_rgb):
-                print("✅ SAM-2 recovery successful, will retry next frame")
-            else:
-                print("❌ SAM-2 recovery failed - returning empty results")
-                # State machine will handle transitions based on empty results
+            # On tracking failure, let state machine handle transitions based on empty results
+            # This is simpler and more reliable than complex recovery attempts
+            print("🔄 Returning empty results - state machine will handle transitions")
             return []
-    
-    def _filter_egocentric_hands(self, detections: List[np.ndarray], frame_shape: tuple) -> List[np.ndarray]:
-        """Filter to most likely egocentric hand based on spatial rules and handedness.
-        
-        Args:
-            detections: List of hand detection arrays
-            frame_shape: (height, width, channels) of the frame
-            
-        Returns:
-            Filtered list of hand detections
-        """
-        # Placeholder implementation - return all detections as-is
-        return detections 
-    
-    # ------------------------------------------------------------------
-    # Memory Management
-    # ------------------------------------------------------------------
     
     def _check_memory_reset(self, frame_rgb: np.ndarray) -> bool:
         """Simple memory management - use original approach until SAM-2 API is clarified."""
@@ -1006,194 +825,30 @@ class GSAM2Wrapper:
         
         return True
     
-    def _attempt_sam2_recovery(self, frame_rgb: np.ndarray) -> bool:
-        """Attempt to recover lost SAM-2 tracking by re-priming with fresh detection."""
-        try:
-            # Use Grounding-DINO to detect objects again
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            multi_prompt = f"{self._prompt}. my {self.handedness} hand"
-            
-            detections, labels = self._call_gdino_with_tracking(
-                frame_bgr=frame_bgr,
-                caption=multi_prompt,
-                call_type="recovery"
-            )
-            
-            if len(detections.xyxy) == 0:
-                return False
-            
-            # Separate object and hand detections
-            object_candidates = []
-            hand_candidates = []
-            
-            for i in range(len(detections.xyxy)):
-                x1, y1, x2, y2 = detections.xyxy[i]
-                conf = float(detections.confidence[i])
-                label = labels[i].lower() if i < len(labels) else ""
-                
-                detection_data = (x1, y1, x2, y2, conf, label)
-                
-                if "hand" in label:
-                    hand_candidates.append(detection_data)
-                else:
-                    object_candidates.append(detection_data)
-            
-            # Select best candidates
-            best_object = self._select_best_candidate(object_candidates, "object")
-            best_hand = self._select_best_candidate(hand_candidates, "hand")
-            
-            if best_object is None and best_hand is None:
-                return False
-            
-            # Get current loss status to determine what needs recovery
-            loss_status = self.loss_tracker.get_loss_status()
-            
-            # Re-prime SAM-2 with newly detected objects
-            if self._inference_state["images"].shape[0] > 0:
-                self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-                frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-            else:
-                # Fresh start - reset inference state
-                self._inference_state = self._sam2_video.init_state(video_path=None)
-                self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-                self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-                frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-                self._frame_count = 0
-            
-            recovered_targets = []
-            
-            # Re-prime object if it was lost and now detected
-            if best_object is not None and (loss_status["object_lost"] or self._tracked_object_id is None):
-                x1, y1, x2, y2, conf, label = best_object
-                object_box = np.array([x1, y1, x2, y2])
-                
-                self._tracked_object_id = 1  # Object gets ID 1
-                
-                _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_object_id,
-                    box=object_box,
-                )
-                
-                recovered_targets.append("object")
-            
-            # Re-prime hand if it was lost and now detected
-            if best_hand is not None and (loss_status["hand_lost"] or self._tracked_hand_id is None):
-                x1, y1, x2, y2, conf, label = best_hand
-                hand_box = np.array([x1, y1, x2, y2])
-                
-                self._tracked_hand_id = 2  # Hand gets ID 2
-                
-                _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_hand_id,
-                    box=hand_box,
-                )
-                
-                recovered_targets.append("hand")
-            
-            if recovered_targets:
-                self._sam2_primed = True
-                self._frame_count = frame_idx + 1
-                return True
-            else:
-                return False
-                
-        except Exception as e:
-            print(f"❌ SAM-2 recovery failed: {e}")
-            return False
-
     def start_hand_tracking(self, frame_rgb: np.ndarray) -> bool:
-        """Initialize hand-first tracking workflow.
-        
-        This method starts the hand-first workflow by detecting and tracking
-        the user's hand. Once successful, the system will be ready to accept
-        object prompts via set_object_prompt().
-        
-        Args:
-            frame_rgb: RGB frame for hand detection
-            
-        Returns:
-            bool: True if hand tracking started successfully
-        """
-        if not self.hand_first_mode:
-            print("⚠️  Hand-first mode not enabled")
-            return False
-            
+        """Start tracking the user's hand for hand-first workflow."""
         try:
             print("🤚 Starting hand detection...")
             
-            # Convert RGB to BGR for Grounding-DINO
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            
-            # Hand-only prompt
             hand_prompt = f"my {self.handedness} hand"
             
-            # Grounding-DINO detection for hand only
-            detections, labels = self._call_gdino_with_tracking(
-                frame_bgr=frame_bgr,
-                caption=hand_prompt,
-                call_type="hand"
-            )
+            # Use unified detection method
+            success = self._detect_and_prime_sam2(frame_rgb, hand_prompt, ["hand"])
             
-            if len(detections.xyxy) == 0:
-                print(f"⚠️  No hand detected")
-                return False
-            
-            # Find best hand candidate
-            hand_candidates = []
-            for i in range(len(detections.xyxy)):
-                x1, y1, x2, y2 = detections.xyxy[i]
-                conf = float(detections.confidence[i])
-                label = labels[i].lower() if i < len(labels) else ""
+            if success:
+                self._hand_initialized = True
                 
-                if "hand" in label:
-                    hand_candidates.append((x1, y1, x2, y2, conf, label))
-            
-            best_hand = self._select_best_candidate(hand_candidates, "hand")
-            if best_hand is None:
+                # Update state machine to reflect successful hand tracking
+                self.tracking_state_machine._transition_to(TrackingState.HAND_READY)
+                
+                # Update loss tracker with successful hand detection
+                self.loss_tracker.update(False, True)  # No object, yes hand
+                
+                print(f"🤚 Hand tracking started! Ready for object prompt.")
+                return True
+            else:
                 print(f"⚠️  No suitable hand found")
                 return False
-            
-            # Set video dimensions in inference state
-            self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-            
-            # Add RGB frame to SAM-2 inference state
-            frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-            
-            # Prime SAM-2 with hand detection
-            x1, y1, x2, y2, conf, label = best_hand
-            hand_box = np.array([x1, y1, x2, y2])
-            
-            self._tracked_hand_id = 2  # Hand gets ID 2
-            
-            _, out_obj_ids, out_mask_logits = self._sam2_video.add_new_points_or_box(
-                inference_state=self._inference_state,
-                frame_idx=frame_idx,
-                obj_id=self._tracked_hand_id,
-                box=hand_box,
-            )
-            
-            self._sam2_primed = True
-            self._hand_initialized = True
-            self._frame_count = frame_idx + 1
-            
-            # Update state machine to reflect successful hand tracking
-            self.tracking_state_machine._transition_to(TrackingState.HAND_READY)
-            
-            # Update loss tracker with successful hand detection
-            hand_detection = np.array([
-                (x1 + x2) / 2, (y1 + y2) / 2,  # xc, yc
-                x2 - x1, y2 - y1,              # w, h
-                self._tracked_hand_id, 1, conf, -1  # track_id, class_id, conf, depth
-            ])
-            self.loss_tracker.update(False, True)  # No object, yes hand
-            
-            print(f"🤚 Hand tracking started! Ready for object prompt.")
-            
-            return True
             
         except Exception as e:
             print(f"❌ Hand tracking initialization failed: {e}")
@@ -1211,10 +866,6 @@ class GSAM2Wrapper:
         Returns:
             bool: True if object search started successfully
         """
-        if not self.hand_first_mode:
-            print("⚠️  Hand-first mode not enabled")
-            return False
-            
         if not self._hand_initialized:
             print("⚠️  Hand tracking not initialized. Call start_hand_tracking() first.")
             return False
@@ -1237,8 +888,7 @@ class GSAM2Wrapper:
     
     def is_ready_for_object_prompt(self) -> bool:
         """Check if system is ready to receive object prompt."""
-        return (self.hand_first_mode and 
-                self._hand_initialized and 
+        return (self._hand_initialized and 
                 self.tracking_state_machine.is_ready_for_object_prompt())
     
     def get_status_message(self) -> str:
@@ -1255,80 +905,29 @@ class GSAM2Wrapper:
             return f"Searching for '{self._prompt}'... ({attempts}/{max_attempts}, frame {self._search_frame_counter}/{self._search_interval})"
         elif state == TrackingState.TRACKING_BOTH:
             return f"Tracking hand and '{self._prompt}'"
-        elif state == TrackingState.RECOVERY:
-            return "Attempting recovery..."
         else:
             return f"Status: {state.value}" 
 
     def _attempt_object_detection(self, frame_bgr: np.ndarray) -> bool:
-        """Detect object and properly add it to SAM-2 using reset_state approach."""
+        """Detect object and add it to SAM-2 using unified detection logic."""
         try:
-            detections, labels = self._call_gdino_with_tracking(
-                frame_bgr=frame_bgr,
-                caption=self._prompt,
-                call_type="object"
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Use unified detection with state reset and hand preservation
+            success = self._detect_and_prime_sam2(
+                frame_rgb, 
+                self._prompt, 
+                ["object"], 
+                reset_state=True, 
+                preserve_existing=["hand"]
             )
-
-            if len(detections.xyxy) == 0:
-                return False
             
-            # Take first decent detection
-            x1, y1, x2, y2 = detections.xyxy[0]
-            conf = float(detections.confidence[0])
-            object_box = np.array([x1, y1, x2, y2])
-            
-            # Use proper SAM-2 workflow to add object during tracking
-            success = self._add_object_with_reset(frame_bgr, object_box)
             return success
         
         except Exception as e:
             print(f"❌ Object detection failed: {e}")
             return False
     
-    def _add_object_with_reset(self, frame_bgr: np.ndarray, object_box: np.ndarray) -> bool:
-        """Add object using proper SAM-2 workflow with reset_state (official approach)."""
-        try:
-            # Convert BGR to RGB for SAM-2
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            
-            # Get current hand bounding box from SAM-2's tracking state
-            if self._last_hand_box is None:
-                return False
-            
-            hand_box = self._last_hand_box.copy()
-            
-            # Reset SAM-2 state and re-add current frame
-            self._sam2_video.reset_state(self._inference_state)
-            frame_idx = self._sam2_video.add_new_frame(self._inference_state, frame_rgb)
-            
-            # Add hand first (preserve existing tracking)
-            self._tracked_hand_id = 2  # Hand gets ID 2
-            _, out_obj_ids_hand, out_mask_logits_hand = self._sam2_video.add_new_points_or_box(
-                inference_state=self._inference_state,
-                frame_idx=frame_idx,
-                obj_id=self._tracked_hand_id,
-                box=hand_box,
-            )
-            
-            # Add new object
-            self._tracked_object_id = 1  # Object gets ID 1
-            _, out_obj_ids_object, out_mask_logits_object = self._sam2_video.add_new_points_or_box(
-                inference_state=self._inference_state,
-                frame_idx=frame_idx,
-                obj_id=self._tracked_object_id,
-                box=object_box,
-            )
-            
-            # Update frame count and state
-            self._frame_count = frame_idx + 1
-            self._last_object_box = object_box.copy()
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to add object with reset: {e}")
-            return False
-
     def _add_frame_streaming(self, inference_state: dict, frame_rgb: np.ndarray) -> int:
         """Ultra-fast frame addition that bypasses SAM-2's slow PIL preprocessing.
         
@@ -1373,3 +972,24 @@ class GSAM2Wrapper:
         inference_state["cached_features"][frame_idx] = (image_batch, backbone_out)
         
         return frame_idx 
+
+    def get_performance_stats(self) -> dict:
+        """Get performance statistics for the tracking system."""
+        current_time = time.time()
+        elapsed_time = current_time - self._start_time
+        average_fps = self._total_frames_processed / elapsed_time if elapsed_time > 0 else 0
+        return {
+            "total_frames_processed": self._total_frames_processed,
+            "elapsed_time": elapsed_time,
+            "average_fps": average_fps,
+        }
+    
+    def print_performance_summary(self) -> None:
+        """Print a simple performance summary."""
+        stats = self.get_performance_stats()
+        print(f"\n📊 GSAM2 Performance Summary:")
+        print(f"   Total frames processed: {stats['total_frames_processed']}")
+        print(f"   Total time: {stats['elapsed_time']:.2f}s")
+        print(f"   Average FPS: {stats['average_fps']:.1f}")
+        print(f"   Real-time capable: {'✅ YES' if stats['average_fps'] >= 25 else '❌ NO'} (25+ FPS)")
+        print() 
