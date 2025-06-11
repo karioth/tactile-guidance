@@ -154,3 +154,4 @@ aibox/resources/
 aibox/experiment/forms
 aibox/results/
 aibox/vision_bridge/*.mp4
+aibox/test_gsam2_performance.py
