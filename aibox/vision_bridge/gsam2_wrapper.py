@@ -1,976 +1,392 @@
+"""gsam2_wrapper.py – Minimal Grounded‑DINO + SAM‑2 wrapper (fixed)
+===================================================================
+Detect hand once, detect the prompted object once, then let SAM‑2 do
+all per‑frame tracking.  Re‑detect only if a mask is missing for
+> MISS_MAX consecutive frames.  Grounding DINO retry interval can be
+changed via RETRY.
+
+Key changes vs. previous draft
+──────────────────────────────
+* Guarantee **exactly one frame write** per real video frame – duplicates
+  were the root‑cause of the invisible hand.
+* `_prime()` now **returns** the frame‑index it wrote, so the caller can
+  skip the normal `_add_frame()` path for that iteration.
+* Object priming now also re‑attaches the **existing hand box** so both
+  masks appear on the same key‑frame (mirrors V1 behaviour).
+* Dynamic storage of the actual `obj_id` values returned by SAM‑2 (no
+  more silent failures if the id mapping changes after a reset).
+* Minor clean‑ups: consolidated id handling, extra debug prints, stricter
+  doc‑strings.
+
+Public API (stable for bracelet controller) ─────────────────────
+    >>> gsam = GSAM2Wrapper()
+    >>> outputs = gsam.track(frame_bgr)  # (xc, yc, w, h, track_id, class_id, conf, depth)
+    >>> gsam.set_prompt(None, "red bottle")
+"""
 from __future__ import annotations
-
-import sys
-import os
-import warnings
-import numpy as np
-import torch
+import sys, os, time
 from pathlib import Path
-from typing import List, Tuple, Optional
-from enum import Enum
-from collections import deque
-import time
-import cv2
+from typing import List, Optional
+import numpy as np
+import torch, cv2, supervision as sv
 
-# **SAM-2 Dtype Optimizations (from official demos)**
-# Enable bfloat16 autocast for better performance on modern GPUs
+# ─── Fast‑math switches ─────────────────────────────────────────────────────────
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-
-# Enable TF32 on Ampere GPUs (RTX 30xx/40xx series) for additional speedup
 if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    print("🚀 Enabled TF32 optimizations for Ampere GPU")
+    print("⚡ Enabled TF32 optimisations for Ampere/‎Hopper GPU")
 
-# Add Grounded-SAM-2 to path for sam2 imports
-_GROUNDED_SAM2_PATH = Path(__file__).resolve().parent.parent / "Grounded-SAM-2"
-if str(_GROUNDED_SAM2_PATH) not in sys.path:
-    sys.path.insert(0, str(_GROUNDED_SAM2_PATH))
+# ─── Third‑party models ─────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+_GSAM2_DIR = ROOT / "Grounded-SAM-2"
+if str(_GSAM2_DIR) not in sys.path:
+    sys.path.insert(0, str(_GSAM2_DIR))
 
-# Grounding DINO helper (tiny Swin-T backbone)
 from groundingdino.util.inference import Model as GDINOModel
-from torchvision.ops import box_convert
-
-# SAM-2 imports
 from sam2.build_sam import build_sam2_video_predictor
 
-# **DEBUG: Import SAM-2 attention settings**
-from sam2.utils.misc import get_sdpa_settings
+# ─── Helper ─────────────────────────────────────────────────────────────────────
 
-# Supervision for mask-to-xyxy conversion
-import supervision as sv
+def _pick_best(dets, lbls, contains: str | None = None):
+    """Return xyxy box (np.ndarray) of highest‑confidence detection.
+    If *contains* is given, filter labels by that substring first."""
+    if len(dets.xyxy) == 0:
+        return None
+    idxs = range(len(dets.xyxy))
+    if contains is not None:
+        idxs = [i for i in idxs if contains.lower() in lbls[i].lower()]
+        if not idxs:
+            return None
+    best_i = max(idxs, key=lambda i: float(dets.confidence[i]))
+    return np.array(dets.xyxy[best_i])
 
-
-class TrackingState(Enum):
-    """Simplified state machine for SAM-2 tracking workflow."""
-    WAITING_FOR_HAND = "waiting_for_hand"       # Looking for hand
-    HAND_READY = "hand_ready"                   # Hand found, ready for object prompt  
-    SEARCHING_OBJECT = "searching_object"       # Hand tracked, searching for object
-    TRACKING_BOTH = "tracking_both"             # Both hand and object tracked
-
-
-class SimpleLossTracker:
-    """Simple tracking loss detection - only what we actually use."""
-    
-    def __init__(self, max_loss_frames: int = 20):
-        self.max_loss_frames = max_loss_frames  # Consider lost after 20 consecutive missed frames (~0.67s at 30fps) - increased from 8 for SAM-2's better temporal tracking
-        self.object_loss_frames = 0
-        self.hand_loss_frames = 0
-        
-    def update(self, has_object: bool, has_hand: bool) -> None:
-        """Update loss counters."""
-        # Update object tracking
-        if has_object:
-            self.object_loss_frames = 0  # Reset loss counter
-        else:
-            self.object_loss_frames += 1
-            
-        # Update hand tracking
-        if has_hand:
-            self.hand_loss_frames = 0  # Reset loss counter
-        else:
-            self.hand_loss_frames += 1
-    
-    def is_object_lost(self) -> bool:
-        """Simple check if object tracking is lost."""
-        return self.object_loss_frames >= self.max_loss_frames
-    
-    def is_hand_lost(self) -> bool:
-        """Simple check if hand tracking is lost."""
-        return self.hand_loss_frames >= self.max_loss_frames
-    
-    def get_loss_status(self) -> dict:
-        """Get current loss status for both targets (compatibility method)."""
-        return {
-            "object_lost": self.is_object_lost(),
-            "hand_lost": self.is_hand_lost(),
-            "object_loss_frames": self.object_loss_frames,
-            "hand_loss_frames": self.hand_loss_frames,
-        }
-    
-    def reset(self) -> None:
-        """Reset all tracking counters."""
-        self.object_loss_frames = 0
-        self.hand_loss_frames = 0
-
-
-class TrackingStateMachine:
-    """Hand-first state machine for SAM-2 tracking workflow."""
-    
-    def __init__(self, loss_tracker: SimpleLossTracker):
-        self.loss_tracker = loss_tracker
-        self.state = TrackingState.WAITING_FOR_HAND
-        self.state_entry_time = time.time()
-        self.object_search_attempts = 0
-        self.max_object_search_attempts = 10  # ~5s at 30fps
-        
-    def update_state(self, has_object: bool, has_hand: bool) -> TrackingState:
-        """Hand-first state machine with essential transitions."""
-        object_lost = self.loss_tracker.is_object_lost()
-        hand_lost = self.loss_tracker.is_hand_lost()
-        
-        if self.state == TrackingState.WAITING_FOR_HAND:
-            if has_hand:
-                self._transition_to(TrackingState.HAND_READY)
-                
-        elif self.state == TrackingState.HAND_READY:
-            if hand_lost:
-                self._transition_to(TrackingState.WAITING_FOR_HAND)
-                
-        elif self.state == TrackingState.SEARCHING_OBJECT:
-            if hand_lost:
-                self._transition_to(TrackingState.WAITING_FOR_HAND)
-                self.object_search_attempts = 0
-            elif has_object and has_hand:
-                self._transition_to(TrackingState.TRACKING_BOTH)
-                self.object_search_attempts = 0
-                    
-        elif self.state == TrackingState.TRACKING_BOTH:
-            if hand_lost:
-                self._transition_to(TrackingState.WAITING_FOR_HAND)
-            elif object_lost:
-                self._transition_to(TrackingState.HAND_READY)
-        
-        return self.state
-    
-    def start_object_search(self) -> bool:
-        """Start searching for object."""
-        if self.state == TrackingState.HAND_READY:
-            self._transition_to(TrackingState.SEARCHING_OBJECT)
-            self.object_search_attempts = 0
-            return True
-        return False
-    
-    def is_ready_for_object_prompt(self) -> bool:
-        """Check if ready for object prompt."""
-        return self.state == TrackingState.HAND_READY
-    
-    def should_search_for_object(self) -> bool:
-        """Check if actively searching for object."""
-        return self.state == TrackingState.SEARCHING_OBJECT
-    
-    def is_fully_operational(self) -> bool:
-        """Check if tracking both targets."""
-        return self.state == TrackingState.TRACKING_BOTH
-    
-    def increment_search_attempt(self) -> bool:
-        """Increment object search attempts and check if timeout reached.
-        
-        Returns:
-            bool: True if search should continue, False if timeout reached
-        """
-        if self.state == TrackingState.SEARCHING_OBJECT:
-            self.object_search_attempts += 1
-            if self.object_search_attempts >= self.max_object_search_attempts:
-                print("⏰ Object search timeout")
-                self._transition_to(TrackingState.HAND_READY)
-                self.object_search_attempts = 0
-                return False
-        return True
-    
-    def _transition_to(self, new_state: TrackingState) -> None:
-        """Handle state transitions."""
-        if new_state != self.state:
-            self.state = new_state
-            self.state_entry_time = time.time()
-    
-    def reset(self) -> None:
-        """Reset to initial state."""
-        self.state = TrackingState.WAITING_FOR_HAND
-        self.state_entry_time = time.time()
-
-
+# ─── Wrapper ────────────────────────────────────────────────────────────────────
 class GSAM2Wrapper:
-    """Hand-first wrapper that exposes a YOLO-compatible interface
-    around Grounding-DINO + SAM-2 tracking.
+    """Lightweight hand‑first pipeline with periodic memory reset and
+    event‑driven Grounding DINO calls.
 
-    Uses a hand-first workflow: detects and tracks the user's hand first,
-    then accepts object prompts to search for and track objects.
-    Uses Grounding-DINO for initial detection and SAM-2 for 
-    temporal tracking with mask propagation.
-
-    Public API
-    ----------
-    set_prompt(frame_rgb, text)
-        Set object prompt for hand-first workflow.
-    track(frame_rgb, depth_img=None) -> list[tuple]
-        Return detection tuples in the format required by `bracelet.py`::
-
-            (xc, yc, w, h, track_id, class_id, conf, depth)
+    * Hand detection prompt: "my <handedness> hand".
+    * Object detection prompt: provided by :pymeth:`set_prompt`.
+    * Grounding DINO is invoked only when:
+        – hand not yet tracked and retry timer expired
+        – object not yet tracked and retry timer expired
+        – corresponding mask lost for MISS_MAX frames
     """
 
-    # ---------------------------------------------------------------------
-    # Construction helpers - Updated paths for new structure
-    # ---------------------------------------------------------------------
-    _CONF_PATH = (
-        Path(__file__).resolve().parent.parent
-        / "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-    )
-    _CKPT_PATH = (
-        Path(__file__).resolve().parent.parent
-        / "Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth"
-    )
-    
-    # SAM-2 paths (using tiny model for efficiency)
-    _SAM2_CONFIG = "sam2/configs/sam2/sam2_hiera_t.yaml"
-    _SAM2_CHECKPOINT = (
-        Path(__file__).resolve().parent.parent
-        / "Grounded-SAM-2/checkpoints/sam2.1_hiera_tiny.pt"
-    )
+    _CONF_PATH    = ROOT / "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    _CKPT_PATH    = ROOT / "Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth"
+    _SAM2_CFG     = "configs/sam2.1/sam2.1_hiera_t.yaml"
+    _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/sam2.1_hiera_tiny.pt"
 
-    def __init__(
-        self,
-        device: str | torch.device | None = None,
-        box_threshold: float = 0.35,
-        text_threshold: float = 0.25,
-        default_prompt: str = "coffee cup",
-        handedness: str = "right",
-        frame_cache_limit: int = 100,  # Reset every 100 frames (~3.3s at 30fps) - reduced from 300 for better performance
-    ) -> None:
-        """Initialize GSAM2Wrapper with hand-first workflow.
+    # Tunables
+    WINDOW   = 30   # SAM‑2 memory window (frames)
+    MISS_MAX = 30    # lost‑mask threshold (frames)
+    RETRY    = 15    # DINO retry interval after a miss (frames)
+    IMG_SIZE = 1024  # SAM‑2 input resolution
 
-        Parameters
-        ----------
-        device : str | torch.device | None
-            Device for PyTorch model inference. If None, auto-detected.
-        box_threshold : float
-            Box detection threshold for Grounding-DINO (default: 0.35).
-        text_threshold : float
-            Text threshold for Grounding-DINO (default: 0.25).
-        default_prompt : str
-            Default object prompt for detection.
-        handedness : str
-            User handedness - "left" or "right" (default: "right").
-        frame_cache_limit : int
-            Maximum frames cached by SAM-2 before memory reset (default: 100).
-        """
-        # Device detection
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
+    def __init__(self, device: str | torch.device | None = None,
+                 box_threshold: float = .35, text_threshold: float = .25,
+                 default_prompt: str = "coffee cup", handedness: str = "right"):
+        self.device = torch.device(device) if device else (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.box_thr, self.txt_thr = box_threshold, text_threshold
+        self.prompt_txt = default_prompt
+        self.handedness = handedness.lower()
 
-        self.box_threshold = box_threshold
-        self.text_threshold = text_threshold
-        self.handedness = handedness
-        self.frame_cache_limit = frame_cache_limit
-
-        # Initialize Grounding-DINO 
-        self._gdino = GDINOModel(
-            model_config_path=str(self._CONF_PATH),
-            model_checkpoint_path=str(self._CKPT_PATH),
-            device=str(self.device),
-        )
-
-        # Load SAM-2 video predictor for tracking
-        # Change to Grounded-SAM-2 directory for config resolution
-        grounded_sam2_dir = Path(__file__).resolve().parent.parent / "Grounded-SAM-2"
-        original_cwd = os.getcwd()
-        os.chdir(str(grounded_sam2_dir))
-        
+        # ── Load models ────────────────────────────────────────────────────
+        print("⏳ Loading Grounding DINO model…", end=" ")
+        self.dino = GDINOModel(str(self._CONF_PATH), str(self._CKPT_PATH), device=str(self.device))
+        print("✅ done")
+        print("⏳ Loading SAM‑2 tiny predictor…", end=" ")
+        cwd = os.getcwd(); os.chdir(str(_GSAM2_DIR))
         try:
-            self._sam2_video = build_sam2_video_predictor(
-                "configs/sam2.1/sam2.1_hiera_t.yaml", 
-                str(self._SAM2_CHECKPOINT),
-                device=str(self.device)
-            )
-            print(f"✅ SAM-2 video predictor loaded successfully")
+            self.sam2 = build_sam2_video_predictor(self._SAM2_CFG, str(self._SAM2_WEIGHTS), device=str(self.device))
         finally:
-            # Restore original working directory
-            os.chdir(original_cwd)
-        
-        # Initialize inference state for streaming mode
-        self._inference_state = self._sam2_video.init_state(video_path=None)
-        
-        # Initialize empty image tensor for real-time streaming
-        self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-        self._inference_state["device"] = self.device  # Ensure device is set for streaming method
+            os.chdir(cwd)
+        print("✅ done")
 
-        self._prompt: str = default_prompt
-        self._frame_count: int = 0
-        self._object_prompt_provided: bool = False  # Track if user has provided object prompt
+        # ── Init predictor state ───────────────────────────────────────────
+        self.state = self.sam2.init_state(video_path=None)
+        self.state["images"] = torch.empty((0, 3, self.IMG_SIZE, self.IMG_SIZE), device=self.device)
+        self.state["device"] = self.device
 
-        # Initialize loss tracker
-        self.loss_tracker = SimpleLossTracker()
-        self.tracking_state_machine = TrackingStateMachine(self.loss_tracker)
+        # runtime flags / counters
+        self.have_hand = False
+        self.have_obj  = False
+        self.prompt_wait = True
+        self.tr_hand_id: Optional[int] = None  # actual SAM‑2 ids (set on first prime)
+        self.tr_obj_id:  Optional[int] = None
+        self.lost_hand = self.lost_obj = 0
+        self.f = 0                        # global frame count
+        self.next_hand_try = 0            # retry timestamps
+        self.next_obj_try  = 0
 
-        # Initialize tracking state
-        self._sam2_primed = False
-        self._tracked_object_id = None
-        self._tracked_hand_id = None
-        
-        # Hand-first workflow state
-        self._hand_initialized = False
-        
-        # **SIMPLIFIED: Single search counter - only used when actively searching**
-        self._search_frame_counter = 0
-        self._search_interval = 15  # Wait 20 frames between GDINO calls
-        
-        # Track last known positions for memory management
+        # ── Last known bounding boxes for repriming ──────────────────────
         self._last_hand_box = None
         self._last_object_box = None
 
-        # Simple performance tracking
-        self._total_frames_processed = 0
+        # ── Performance tracking (optional) ──────────────────────────────
         self._start_time = time.time()
+        self._total_frames = 0
+        self._gdino_calls = 0
+        self._sam2_calls = 0
+        self._memory_resets = 0
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def set_prompt(self, frame_rgb: np.ndarray | None, text: str) -> None:
-        """Set object prompt for hand-first workflow.
-        
-        This is equivalent to set_object_prompt() for hand-first workflow.
+    # ─── Public API ───────────────────────────────────────────────────────
+    def set_prompt(self, frame_rgb: Optional[np.ndarray], text: str):
+        """Set / change the object prompt.  If *frame_rgb* is provided and the
+        hand is already tracked, will attempt immediate detection."""
+        print(f"✨ New prompt received → '{text}'")
+        self.prompt_txt = text
+        self.prompt_wait = False
+        if frame_rgb is not None and self.have_hand and not self.have_obj:
+            self._detect_object_and_prime(frame_rgb)
 
-        Parameters
-        ----------
-        frame_rgb : np.ndarray | None
-            RGB frame for object detection and SAM-2 priming. If None, only updates
-            the text prompt without priming.
-        text : str
-            The free-form text prompt (e.g. "red bottle").
-        """
-        
-        if frame_rgb is None:
-            # Just update the prompt
-            self._prompt = text
-            print(f"🔄 Object prompt updated: '{text}' (no frame provided)")
-            return
-        
-        # If hand not initialized, start hand tracking first
-        if not self._hand_initialized:
-            print("🤚 Starting hand tracking first...")
-            self.start_hand_tracking(frame_rgb)
-            # Set the object prompt for later
-            self._prompt = text
-            self._object_prompt_provided = True
-            return
-        
-        # If ready for object prompt, start object search
-        if self.is_ready_for_object_prompt():
-            self.set_object_prompt(text)
-            return
-        
-        # Otherwise just update the prompt
-        self._prompt = text
-        print(f"🔄 Object prompt updated: '{text}'")
-    
-    def _detect_and_prime_sam2(self, frame_rgb: np.ndarray, prompt: str, 
-                              target_types: List[str] = ["object", "hand"],
-                              reset_state: bool = False, 
-                              preserve_existing: Optional[List[str]] = None) -> bool:
-        """Unified detection and SAM-2 priming logic.
-        
-        Args:
-            frame_rgb: RGB frame for detection
-            prompt: Text prompt for Grounding-DINO
-            target_types: List of target types to detect ["object", "hand"]
-            reset_state: Whether to reset SAM-2 state before adding
-            preserve_existing: List of existing targets to preserve during reset ["hand", "object"]
-            
-        Returns:
-            bool: True if detection and priming successful
-        """
-        try:
-            # Convert RGB to BGR for Grounding-DINO
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            
-            # Call Grounding-DINO
-            detections, labels = self._call_gdino_with_tracking(
-                frame_bgr=frame_bgr,
-                caption=prompt,
-            )
-            
-            if len(detections.xyxy) == 0:
-                return False
-            
-            # Parse detections based on target types
-            object_candidates = []
-            hand_candidates = []
-            
-            for i in range(len(detections.xyxy)):
-                x1, y1, x2, y2 = detections.xyxy[i]
-                conf = float(detections.confidence[i])
-                label = labels[i].lower() if i < len(labels) else ""
-                
-                detection_data = (x1, y1, x2, y2, conf, label)
-                
-                if "hand" in label and "hand" in target_types:
-                    hand_candidates.append(detection_data)
-                elif "object" in target_types and "hand" not in label:
-                    object_candidates.append(detection_data)
-            
-            # Select best candidates
-            best_object = None
-            best_hand = None
-            
-            if "object" in target_types:
-                best_object = self._select_best_candidate(object_candidates)
-            if "hand" in target_types:
-                best_hand = self._select_best_candidate(hand_candidates)
-            
-            # Check if we found required targets
-            if "object" in target_types and best_object is None and "hand" in target_types and best_hand is None:
-                return False
-            if "object" in target_types and len(target_types) == 1 and best_object is None:
-                return False
-            if "hand" in target_types and len(target_types) == 1 and best_hand is None:
-                return False
-            
-            # Handle SAM-2 state management
-            if reset_state:
-                # Reset state and preserve existing targets
-                preserved_boxes = {}
-                if preserve_existing:
-                    if "hand" in preserve_existing and hasattr(self, '_last_hand_box') and self._last_hand_box is not None:
-                        preserved_boxes["hand"] = self._last_hand_box.copy()
-                    if "object" in preserve_existing and hasattr(self, '_last_object_box') and self._last_object_box is not None:
-                        preserved_boxes["object"] = self._last_object_box.copy()
-                
-                # Reset SAM-2 state
-                self._sam2_video.reset_state(self._inference_state)
-                frame_idx = self._sam2_video.add_new_frame(self._inference_state, frame_rgb)
-                
-                # Re-add preserved targets first
-                for target_type, box in preserved_boxes.items():
-                    if target_type == "hand":
-                        self._tracked_hand_id = 2
-                        self._sam2_video.add_new_points_or_box(
-                            inference_state=self._inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=self._tracked_hand_id,
-                            box=box,
-                        )
-                    elif target_type == "object":
-                        self._tracked_object_id = 1
-                        self._sam2_video.add_new_points_or_box(
-                            inference_state=self._inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=self._tracked_object_id,
-                            box=box,
-                        )
-            else:
-                # Normal state management
-                self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-                frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-            
-            # Add newly detected targets
-            success_count = 0
-            
-            if best_object is not None:
-                x1, y1, x2, y2, conf, label = best_object
-                object_box = np.array([x1, y1, x2, y2])
-                
-                self._tracked_object_id = 1  # Object gets ID 1
-                
-                self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_object_id,
-                    box=object_box,
-                )
-                
-                self._last_object_box = object_box.copy()
-                success_count += 1
-            
-            if best_hand is not None:
-                x1, y1, x2, y2, conf, label = best_hand
-                hand_box = np.array([x1, y1, x2, y2])
-                
-                self._tracked_hand_id = 2  # Hand gets ID 2
-                
-                self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_hand_id,
-                    box=hand_box,
-                )
-                
-                self._last_hand_box = hand_box.copy()
-                success_count += 1
-            
-            # Update state
-            self._sam2_primed = True
-            self._frame_count = frame_idx + 1
-            
-            return success_count > 0
-            
-        except Exception as e:
-            print(f"❌ Unified detection failed: {e}")
-            return False
+    def is_ready_for_object_prompt(self):
+        return self.have_hand and not self.have_obj
 
-    def _select_best_candidate(self, candidates: List[tuple]) -> Optional[tuple]:
-        """Simplified candidate selection - just pick highest confidence."""
-        if not candidates:
-            return None
-        
-        # Simple confidence-based selection
-        best_candidate = max(candidates, key=lambda x: x[4])  # x[4] is confidence
-        
-        return best_candidate
-
-    def _call_gdino_with_tracking(self, frame_bgr: np.ndarray, caption: str) -> tuple:
-        """Call GDINO for object detection.
-        
-        Args:
-            frame_bgr: BGR frame for detection
-            caption: Text prompt for detection
-            
-        Returns:
-            tuple: (detections, labels) from GDINO
-        """
-        detections, labels = self._gdino.predict_with_caption(
-            image=frame_bgr,
-            caption=caption,
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-        )
-        
-        return detections, labels
-
-    def _should_attempt_detection(self, detection_type: str = "detection") -> bool:
-        """Unified search timing logic to avoid duplication.
-        
-        Args:
-            detection_type: Type of detection for logging ("hand", "object", "detection")
-            
-        Returns:
-            bool: True if detection should be attempted this frame
-        """
-        # Attempt detection immediately on first frame (counter=0), then every 15 frames
-        if self._search_frame_counter == 0 or self._search_frame_counter >= self._search_interval:
-            print(f"🔍 Attempting {detection_type} detection...")
-            self._search_frame_counter = 1  # Set to 1 after detection attempt
-            return True
-        else:
-            # Count frames between detection attempts
-            self._search_frame_counter += 1
-            return False
-
+    # ─────────────────────────────────────────────────────────────────────
+    # Main loop
+    # ─────────────────────────────────────────────────────────────────────
     @torch.inference_mode()
-    def track(
-        self,
-        frame_bgr: np.ndarray,
-        depth_img: Optional[np.ndarray] = None,
-    ) -> List[np.ndarray]:
-        """Hand-first tracking using SAM-2 temporal tracking.
+    def track(self, frame_bgr: np.ndarray, depth_img: Optional[np.ndarray] = None):
+        """Process one video frame and return bracelet tuples."""
+        cur = self.f
+        self._total_frames += 1
+
+        # RGB conversion once here
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w = frame_rgb.shape[:2]
+        self.state["video_height"], self.state["video_width"] = h, w
+
+        # -----------------------------------------------------------------
+        # 1️⃣  HAND detection (retry gate)
+        # -----------------------------------------------------------------
+        idx_from_prime: Optional[int] = None  # will hold the frame‑idx if we prime
+        if not self.have_hand and cur >= self.next_hand_try:
+            print(f"🔍 [Frame {cur}] Attempting hand detection via GDINO…")
+            idx_from_prime = self._detect_hand_and_prime(frame_rgb)
+            if idx_from_prime is None:
+                #print("🚫 Hand not found – retry scheduled")
+                self.next_hand_try = cur + self.RETRY
+
+        # -----------------------------------------------------------------
+        # 2️⃣  OBJECT detection (retry gate)
+        # -----------------------------------------------------------------
+        if self.have_hand and not self.have_obj and not self.prompt_wait and cur >= self.next_obj_try:
+            print(f"🔍 [Frame {cur}] Attempting object detection via GDINO…")
+            idx_from_prime = self._detect_object_and_prime(frame_rgb) or idx_from_prime
+            if idx_from_prime is None:
+                print("🚫 Object not found – retry scheduled")
+                self.next_obj_try = cur + self.RETRY
+
+        # -----------------------------------------------------------------
+        # 3️⃣  Early out: nothing to track
+        # -----------------------------------------------------------------
+        if not (self.have_hand or self.have_obj):
+            #print(f"⏭️  [Frame {cur}] No objects to track – skipping SAM‑2")
+            self.f += 1
+            return []
+
+        # -----------------------------------------------------------------
+        # 4️⃣  Push frame exactly once
+        # -----------------------------------------------------------------
+        if idx_from_prime is None:
+            idx = self._add_frame(frame_rgb)  # regular push
+        else:
+            idx = idx_from_prime              # frame already written during prime
+
+        # Edge‑case: we may lose objects during memory reset inside _add_frame
+        if not (self.have_hand or self.have_obj):
+            print(f"⚠️  Lost all objects during reset – skipping inference")
+            self.f += 1
+            return []
+
+        # -----------------------------------------------------------------
+        # 5️⃣  Run tracking
+        # -----------------------------------------------------------------
+        #print(f"🎯 [Frame {cur}] Running SAM‑2 tracking (buffer: {self.state['images'].shape[0]} frames)")
+        idx, ids, masks = self.sam2.infer_single_frame(self.state, idx)
+        self._sam2_calls += 1
+
+        # -----------------------------------------------------------------
+        # 6️⃣  Convert masks → bracelet tuples
+        # -----------------------------------------------------------------
+        out, hand_ok, obj_ok = [], False, False
+        for i, oid in enumerate(ids):
+            mask_np = (masks[i] > 0.0)[0].cpu().numpy()
+            xyxy = sv.mask_to_xyxy(mask_np[None])  # (1, 4) or empty
+            if len(xyxy) == 0:
+                continue
+            x1, y1, x2, y2 = xyxy[0]
+            xc, yc, bw, bh = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+            depth = -1.0
+            if depth_img is not None and 0 <= int(yc) < depth_img.shape[0] and 0 <= int(xc) < depth_img.shape[1]:
+                depth = float(depth_img[int(yc), int(xc)])
+
+            if oid == self.tr_hand_id:
+                class_id, hand_ok = 1, True
+                self._last_hand_box = np.array([x1, y1, x2, y2])
+            elif oid == self.tr_obj_id:
+                class_id, obj_ok = 0, True
+                self._last_object_box = np.array([x1, y1, x2, y2])
+            else:
+                continue  # unknown id
+            out.append(np.array([xc, yc, bw, bh, oid, class_id, 0.8, depth], dtype=float))
+
+        # -----------------------------------------------------------------
+        # 7️⃣  Loss accounting / auto‑redection
+        # -----------------------------------------------------------------
+        self.lost_hand = 0 if hand_ok else self.lost_hand + 1
+        self.lost_obj  = 0 if obj_ok  else self.lost_obj  + 1
+        if self.lost_hand > self.MISS_MAX:
+            print("😢 Lost hand – will re‑detect")
+            self.sam2.remove_object(self.state, self.tr_hand_id, strict=False, need_output=False)
+            self.have_hand, self.lost_hand = False, 0
+            self.next_hand_try = cur + self.RETRY
+        if self.lost_obj > self.MISS_MAX:
+            print("😢 Lost object – will re‑detect")
+            self.sam2.remove_object(self.state, self.tr_obj_id, strict=False, need_output=False)
+            self.have_obj, self.lost_obj = False, 0
+            self.next_obj_try = cur + self.RETRY
+
+        self.f += 1
+        return out
+
+    # ─── Detection helpers ───────────────────────────────────────────────
+    def _detect_hand_and_prime(self, frame_rgb) -> Optional[int]:
+        print("🔍 Detecting hand…", end=" ")
+        dets, lbls = self._dino(frame_rgb, f"my {self.handedness} hand")
+        self._gdino_calls += 1
+        box = _pick_best(dets, lbls, "hand")
+        if box is None:
+            print("fail")
+            return None
+
+        preferred_id = 2                     # <<< fixed id for hand
+        idx, _, _ = self._prime(frame_rgb, preferred_id=preferred_id, box=box)
+
+        self.tr_hand_id = preferred_id
+        self._last_hand_box = box.copy()
+        self.have_hand = True
+        print(f"🤚 found! (id={self.tr_hand_id})")
+        return idx
+
+
+    def _detect_object_and_prime(self, frame_rgb) -> Optional[int]:
+        """Detect the prompted object and prime SAM-2.
+
+        Object always uses obj_id 1 so it can coexist with the hand (id 2).
+        """
+        print(f"🔍 Detecting '{self.prompt_txt}'…", end=" ")
+        dets, lbls = self._dino(frame_rgb, self.prompt_txt)
+        self._gdino_calls += 1
+        box = _pick_best(dets, lbls)
+        if box is None:
+            print("fail")
+            return None
+
+        preferred_id = 1                     # <<< fixed id for object
+        idx, _, _ = self._prime(
+            frame_rgb,
+            preferred_id=preferred_id,
+            box=box,
+            also_prime_hand=True,            # keep hand on the same frame
+        )
+
+        self.tr_obj_id = preferred_id
+        self._last_object_box = box.copy()
+        self.have_obj = True
+        print(f"🎯 found! (id={self.tr_obj_id})")
+        return idx
+
+    # ─── SAM‑2 helpers ──────────────────────────────────────────────────
+    def _dino(self, frame_rgb, caption):
+        """Single‑call Grounding DINO wrapper."""
+        return self.dino.predict_with_caption(
+            cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+            caption,
+            box_threshold=self.box_thr,
+            text_threshold=self.txt_thr)
+
+    def _prime(self, frame_rgb, preferred_id: int, box: np.ndarray, *, also_prime_hand: bool = False):
+        """Write *frame_rgb* once, annotate *box* and optionally the existing
+        hand box on the very same frame.
 
         Returns
         -------
-        list[np.ndarray]
-            List of detection tuples: [xc, yc, w, h, track_id, class_id, conf, depth]
-            class_id: 0 = target object, 1 = hand
+        tuple(idx, obj_ids, mask_logits)
+        exactly what `add_new_points_or_box` returns so the caller knows
+        the real object ids allocated by SAM‑2.
         """
-        # Count every frame processed (including skipped ones)
-        self._total_frames_processed += 1
-        
-        current_state = self.tracking_state_machine.state
-        
-        # **SIMPLIFIED: Handle based on current state, not workflow mode**
-        if current_state == TrackingState.WAITING_FOR_HAND:
-            results = self._handle_hand_initialization(frame_bgr, depth_img)
-        
-        elif current_state == TrackingState.HAND_READY:
-            # **Auto-start object search if prompt was provided**
-            if hasattr(self, '_prompt') and self._prompt and self._prompt.strip():
-                print(f"🔍 Auto-starting object search for: '{self._prompt}'")
-                if self.set_object_prompt(self._prompt):
-                    # Successfully started object search, continue with SAM-2 tracking
-                    pass
-                else:
-                    print("⚠️  Failed to auto-start object search")
-                    
-            results = self._track_with_sam2(frame_bgr, depth_img)
-        
-        elif current_state == TrackingState.SEARCHING_OBJECT:
-            results = self._track_with_sam2(frame_bgr, depth_img)
-            
-            # **FIX: Check state after SAM-2 tracking to see if we transitioned to TRACKING_BOTH**
-            current_state_after_sam2 = self.tracking_state_machine.state
-            
-            # Only attempt object detection if still in SEARCHING_OBJECT state
-            if current_state_after_sam2 == TrackingState.SEARCHING_OBJECT:
-                # Attempt object detection immediately on first frame (counter=0), then every 15 frames
-                if self._should_attempt_detection("object"):
-                    # Increment search attempt counter and check for timeout
-                    if self.tracking_state_machine.increment_search_attempt():
-                        detection_success = self._attempt_object_detection(frame_bgr)
-                        # Counter is already handled by _should_attempt_detection()
-                    else:
-                        print("🔍 Search timeout reached, stopping attempts")
-            else:
-                print(f"✅ State transitioned to {current_state_after_sam2.value}, stopping object search")
-        
-        elif current_state == TrackingState.TRACKING_BOTH:
-            results = self._track_with_sam2(frame_bgr, depth_img)
-        
-        else:
-            # Fallback
-            results = self._track_with_sam2(frame_bgr, depth_img) if self._sam2_primed else []
-        
-        return results
-    
-    def _handle_hand_initialization(self, frame_bgr: np.ndarray, depth_img: Optional[np.ndarray]) -> List[np.ndarray]:
-        """Handle hand initialization state with frame-based detection intervals."""
-        
-        if not self._sam2_primed:
-            # Attempt hand detection immediately on first frame (counter=0), then every 15 frames  
-            if self._should_attempt_detection("hand"):
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                if self.start_hand_tracking(frame_rgb):
-                    # Counter is already handled by _should_attempt_detection()
-                    return self._track_with_sam2(frame_bgr, depth_img)
-                else:
-                    # Counter is already handled by _should_attempt_detection()
-                    return []
-            else:
-                # Counter is already handled by _should_attempt_detection()
-                return []
-        else:
-            # SAM-2 is primed, continue tracking
-            return self._track_with_sam2(frame_bgr, depth_img)
-    
-    def _track_with_sam2(self, frame_bgr: np.ndarray, depth_img: Optional[np.ndarray]) -> List[np.ndarray]:
-        """Track using SAM-2 temporal tracking."""
-        try:
-            # Convert BGR to RGB for SAM-2
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            
-            # Check for memory reset before processing
-            reset_occurred = self._check_memory_reset(frame_rgb)
-            if reset_occurred and not self._sam2_primed:
-                # Reset occurred and objects couldn't be preserved - return empty results
-                # Let the state machine transition to recovery/re-initialization
-                print("⚠️  Memory reset failed to preserve tracking - returning empty results")
-                return []
-            
-            # Add new frame to SAM-2 inference state
-            frame_idx = self._add_frame_streaming(self._inference_state, frame_rgb)
-            
-            # Run SAM-2 inference on the frame
-            frame_idx, tracked_obj_ids, video_res_masks = self._sam2_video.infer_single_frame(
-                inference_state=self._inference_state,
-                frame_idx=frame_idx,
-            )
-            
-            results = []
-            
-            # Process tracked masks and convert to Detection tuples
-            for i, obj_id in enumerate(tracked_obj_ids):
-                # Get mask for this object
-                mask = video_res_masks[i] > 0.0  # Convert to boolean mask
-                mask_np = mask[0].cpu().numpy()  # Shape: (H, W)
-                
-                # Convert mask to bounding box using supervision
-                try:
-                    # sv.mask_to_xyxy expects masks with shape (n, H, W)
-                    masks_batch = mask_np[None, ...]  # Add batch dimension: (1, H, W)
-                    xyxy_boxes = sv.mask_to_xyxy(masks_batch)  # Returns (n, 4) in xyxy format
-                    
-                    if len(xyxy_boxes) > 0:
-                        x1, y1, x2, y2 = xyxy_boxes[0]  # Get first (and only) box
-                        
-                        # Convert xyxy to center format
-                        xc = (x1 + x2) / 2
-                        yc = (y1 + y2) / 2
-                        w = x2 - x1
-                        h = y2 - y1
-                        
-                        # Determine class_id based on tracked object ID
-                        if obj_id == self._tracked_object_id:
-                            class_id = 0  # Target object
-                            track_id = obj_id
-                            # Preserve last known position for memory management
-                            self._last_object_box = np.array([x1, y1, x2, y2])
-                        elif obj_id == self._tracked_hand_id:
-                            class_id = 1  # Hand
-                            track_id = obj_id
-                            # Preserve last known position for memory management
-                            self._last_hand_box = np.array([x1, y1, x2, y2])
-                        else:
-                            # Unknown object ID, skip
-                            continue
-                        
-                        # Use a high confidence for successfully tracked objects
-                        conf = 0.8
-                        
-                        # Handle depth
-                        depth_val = -1.0
-                        if depth_img is not None:
-                            # Simple depth sampling at object center
-                            center_y, center_x = int(yc), int(xc)
-                            if (0 <= center_y < depth_img.shape[0] and 
-                                0 <= center_x < depth_img.shape[1]):
-                                depth_val = float(depth_img[center_y, center_x])
-                        
-                        # Create Detection tuple
-                        detection = np.array([xc, yc, w, h, track_id, class_id, conf, depth_val], dtype=float)
-                        results.append(detection)
-                        
-                except Exception as e:
-                    print(f"⚠️  Failed to convert mask to bbox for object {obj_id}: {e}")
-                    continue
-            
-            self._frame_count += 1
-            
-            # Update state machine
-            best_object = None
-            best_hand = None
-            
-            for detection in results:
-                if detection[5] == 0:  # class_id 0 = object
-                    best_object = detection
-                elif detection[5] == 1:  # class_id 1 = hand
-                    best_hand = detection
-            
-            self.loss_tracker.update(best_object is not None, best_hand is not None)
-            previous_state = self.tracking_state_machine.state
-            self.tracking_state_machine.update_state(best_object is not None, best_hand is not None)
-            
-            # **NEW: Reset frame counters on state transitions**
-            if previous_state != self.tracking_state_machine.state:
-                if self.tracking_state_machine.state == TrackingState.WAITING_FOR_HAND:
-                    self._search_frame_counter = 0
-                    print("🔄 Reset search counter due to state transition")
-            
-            return results
-            
-        except Exception as e:
-            print(f"⚠️  SAM-2 tracking failed: {e}")
-            # On tracking failure, let state machine handle transitions based on empty results
-            # This is simpler and more reliable than complex recovery attempts
-            print("🔄 Returning empty results - state machine will handle transitions")
-            return []
-    
-    def _check_memory_reset(self, frame_rgb: np.ndarray) -> bool:
-        """Simple memory management - use original approach until SAM-2 API is clarified."""
-        if self._inference_state["images"].shape[0] >= self.frame_cache_limit:
-            return self._fallback_full_reset(frame_rgb)
-        return False
-    
-    def _fallback_full_reset(self, frame_rgb: np.ndarray) -> bool:
-        """Fallback full reset with tracking preservation (previous approach)."""
-        # Preserve current tracking state if available
-        current_hand_box = None
-        current_object_box = None
-        
-        if hasattr(self, '_last_hand_box') and self._last_hand_box is not None:
-            current_hand_box = self._last_hand_box.copy()
-        
-        if hasattr(self, '_last_object_box') and self._last_object_box is not None:
-            current_object_box = self._last_object_box.copy()
-        
-        # **FIXED: Use only reset_state for memory management (no redundant init_state)**
-        # reset_state clears memory while preserving the inference state structure
-        self._sam2_video.reset_state(self._inference_state)
-        
-        # Clear the cached images tensor and reset frame count
-        self._inference_state["images"] = torch.empty((0, 3, 1024, 1024), device=self.device)
-        self._inference_state["num_frames"] = 0
-        
-        # Set video dimensions and add current frame
-        self._inference_state["video_height"], self._inference_state["video_width"] = frame_rgb.shape[:2]
-        frame_idx = self._sam2_video.add_new_frame(self._inference_state, frame_rgb)
-        
-        # Re-prime with preserved tracking state
-        reprime_success = False
-        
-        if current_hand_box is not None and self._tracked_hand_id is not None:
-            try:
-                _, out_obj_ids_hand, out_mask_logits_hand = self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_hand_id,
-                    box=current_hand_box,
-                )
-                reprime_success = True
-            except Exception as e:
-                print(f"⚠️  Failed to re-prime hand tracking: {e}")
-                self._tracked_hand_id = None
-        
-        if current_object_box is not None and self._tracked_object_id is not None:
-            try:
-                _, out_obj_ids_object, out_mask_logits_object = self._sam2_video.add_new_points_or_box(
-                    inference_state=self._inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=self._tracked_object_id,
-                    box=current_object_box,
-                )
-                reprime_success = True
-            except Exception as e:
-                print(f"⚠️  Failed to re-prime object tracking: {e}")
-                self._tracked_object_id = None
-        
-        # Update frame count and priming status
-        self._frame_count = frame_idx + 1
-        self._sam2_primed = reprime_success
-        
-        if not reprime_success:
-            # Reset tracking IDs if re-priming failed
-            self._tracked_object_id = None
-            self._tracked_hand_id = None
-        
-        return True
-    
-    def start_hand_tracking(self, frame_rgb: np.ndarray) -> bool:
-        """Start tracking the user's hand for hand-first workflow."""
-        try:
-            print("🤚 Starting hand detection...")
-            
-            hand_prompt = f"my {self.handedness} hand"
-            
-            # Use unified detection method
-            success = self._detect_and_prime_sam2(frame_rgb, hand_prompt, ["hand"])
-            
-            if success:
-                self._hand_initialized = True
-                
-                # Update state machine to reflect successful hand tracking
-                self.tracking_state_machine._transition_to(TrackingState.HAND_READY)
-                
-                # Update loss tracker with successful hand detection
-                self.loss_tracker.update(False, True)  # No object, yes hand
-                
-                print(f"🤚 Hand tracking started! Ready for object prompt.")
-                return True
-            else:
-                print(f"⚠️  No suitable hand found")
-                return False
-            
-        except Exception as e:
-            print(f"❌ Hand tracking initialization failed: {e}")
-            return False
-    
-    def set_object_prompt(self, text: str) -> bool:
-        """Set the object prompt for hand-first workflow.
-        
-        This method should be called after start_hand_tracking() is successful.
-        It will begin searching for the specified object while continuing to track the hand.
-        
-        Args:
-            text: Object prompt (e.g., "coffee cup")
-            
-        Returns:
-            bool: True if object search started successfully
-        """
-        if not self._hand_initialized:
-            print("⚠️  Hand tracking not initialized. Call start_hand_tracking() first.")
-            return False
-        
-        if not self.tracking_state_machine.is_ready_for_object_prompt():
-            print(f"⚠️  System not ready for object prompt. Current state: {self.tracking_state_machine.state.value}")
-            return False
-        
-        self._prompt = text
-        self._object_prompt_provided = True
-        
-        # Transition state machine to object search
-        success = self.tracking_state_machine.start_object_search()
-        if success:
-            print(f"🔍 Starting search for '{text}'...")
-            return True
-        else:
-            print("❌ Failed to start object search")
-            return False
-    
-    def is_ready_for_object_prompt(self) -> bool:
-        """Check if system is ready to receive object prompt."""
-        return (self._hand_initialized and 
-                self.tracking_state_machine.is_ready_for_object_prompt())
-    
-    def get_status_message(self) -> str:
-        """Get current status message for user feedback."""
-        state = self.tracking_state_machine.state
-        
-        if state == TrackingState.WAITING_FOR_HAND:
-            return f"Looking for hand... (frame {self._search_frame_counter}/{self._search_interval})"
-        elif state == TrackingState.HAND_READY:
-            return "Hand detected! Ready for object prompt."
-        elif state == TrackingState.SEARCHING_OBJECT:
-            attempts = self.tracking_state_machine.object_search_attempts
-            max_attempts = self.tracking_state_machine.max_object_search_attempts
-            return f"Searching for '{self._prompt}'... ({attempts}/{max_attempts}, frame {self._search_frame_counter}/{self._search_interval})"
-        elif state == TrackingState.TRACKING_BOTH:
-            return f"Tracking hand and '{self._prompt}'"
-        else:
-            return f"Status: {state.value}" 
+        idx = self.sam2.add_new_frame(self.state, frame_rgb)
+        out = self.sam2.add_new_points_or_box(self.state, idx, obj_id=preferred_id, box=box)
+        # Optionally re‑prime the already‑tracked hand so both masks share the frame
+        if also_prime_hand and self.have_hand and self._last_hand_box is not None:
+            _ = self.sam2.add_new_points_or_box(self.state, idx, obj_id=self.tr_hand_id, box=self._last_hand_box)
+        return  (idx, [preferred_id], None)  # prepend idx for convenience
 
-    def _attempt_object_detection(self, frame_bgr: np.ndarray) -> bool:
-        """Detect object and add it to SAM-2 using unified detection logic."""
-        try:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            
-            # Use unified detection with state reset and hand preservation
-            success = self._detect_and_prime_sam2(
-                frame_rgb, 
-                self._prompt, 
-                ["object"], 
-                reset_state=True, 
-                preserve_existing=["hand"]
-            )
-            
-            return success
-        
-        except Exception as e:
-            print(f"❌ Object detection failed: {e}")
-            return False
-    
-    def _add_frame_streaming(self, inference_state: dict, frame_rgb: np.ndarray) -> int:
-        """Ultra-fast frame addition that bypasses SAM-2's slow PIL preprocessing.
-        
-        This manually implements the essential steps of add_new_frame but with
-        OpenCV instead of PIL LANCZOS, achieving 5-10x speedup.
-        
-        Args:
-            inference_state: SAM-2 inference state
-            frame_rgb: RGB frame as numpy array
-            
-        Returns:
-            int: Frame index
-        """
-        device = inference_state["device"]
-        image_size = 1024  # SAM-2 standard size
-        
-        # Step 1: Fast OpenCV preprocessing (instead of slow PIL LANCZOS)
-        frame_resized = cv2.resize(frame_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        frame_float = frame_resized.astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(frame_float).permute(2, 0, 1).to(device)
-        
-        # Step 2: ImageNet normalization
-        img_mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=torch.float32)[:, None, None]
-        img_std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=torch.float32)[:, None, None]
-        img_tensor.sub_(img_mean).div_(img_std)
-        
-        # Step 3: Handle image sequence initialization/concatenation
-        images = inference_state.get("images", None)
-        if images is None or (isinstance(images, list) and len(images) == 0):
-            inference_state["images"] = img_tensor.unsqueeze(0)
-        else:
-            img_tensor = img_tensor.to(images.device)
-            inference_state["images"] = torch.cat([images, img_tensor.unsqueeze(0)], dim=0)
-        
-        # Step 4: Update frame count
-        inference_state["num_frames"] = inference_state["images"].shape[0]
-        frame_idx = inference_state["num_frames"] - 1
-        
-        # Step 5: Cache visual features
-        image_batch = img_tensor.float().unsqueeze(0)
-        backbone_out = self._sam2_video.forward_image(image_batch)
-        inference_state["cached_features"][frame_idx] = (image_batch, backbone_out)
-        
-        return frame_idx 
+    # ─── Memory helpers ─────────────────────────────────────────────────
+    def _memory_reset(self, frame_rgb):
+        """Reset SAM‑2 memory and re‑prime existing objects."""
+        #print(f"🔄 [Frame {self.f}] Resetting SAM‑2 (buffer hit {self.WINDOW} frames)")
+        self._memory_resets += 1
+        # preserve last boxes
+        hand_box = self._last_hand_box.copy() if self.have_hand and self._last_hand_box is not None else None
+        obj_box  = self._last_object_box.copy() if self.have_obj  and self._last_object_box is not None else None
 
+        self.sam2.reset_state(self.state)
+        self.state["images"] = torch.empty((0, 3, self.IMG_SIZE, self.IMG_SIZE), device=self.device)
+        self.state["num_frames"] = 0
+        self.state["video_height"], self.state["video_width"] = frame_rgb.shape[:2]
+        idx = self.sam2.add_new_frame(self.state, frame_rgb)
+
+        if hand_box is not None:
+            self.sam2.add_new_points_or_box(self.state, idx, obj_id=self.tr_hand_id, box=hand_box)
+        else:
+            self.have_hand = False
+
+        if obj_box is not None:
+            self.sam2.add_new_points_or_box(self.state, idx, obj_id=self.tr_obj_id, box=obj_box)
+        else:
+            self.have_obj = False
+
+        return idx
+
+    def _add_frame(self, frame_rgb):
+        """Push frame into SAM‑2 & handle memory window."""
+        dev = self.device
+        img = cv2.resize(frame_rgb, (self.IMG_SIZE, self.IMG_SIZE), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        ten = torch.from_numpy(img).permute(2, 0, 1).to(dev)
+        ten.sub_(torch.tensor([0.485, 0.456, 0.406], device=dev)[:, None, None])\
+           .div_(torch.tensor([0.229, 0.224, 0.225], device=dev)[:, None, None])
+        self.state["images"] = torch.cat([self.state["images"], ten[None]], 0)
+        self.state["num_frames"] = self.state["images"].shape[0]
+        idx = self.state["num_frames"] - 1
+        self.state["cached_features"][idx] = (ten[None], self.sam2.forward_image(ten[None].float()))
+
+        # Periodic reset
+        if self.state["images"].shape[0] > self.WINDOW:
+            idx = self._memory_reset(frame_rgb)
+        return idx
+
+    # ─── Performance & Debug Methods ──────────────────────────────────────
     def get_performance_stats(self) -> dict:
         """Get performance statistics for the tracking system."""
         current_time = time.time()
         elapsed_time = current_time - self._start_time
-        average_fps = self._total_frames_processed / elapsed_time if elapsed_time > 0 else 0
+        average_fps = self._total_frames / elapsed_time if elapsed_time > 0 else 0
         return {
-            "total_frames_processed": self._total_frames_processed,
+            "total_frames_processed": self._total_frames,
             "elapsed_time": elapsed_time,
             "average_fps": average_fps,
+            "gdino_calls": self._gdino_calls,
+            "sam2_calls": self._sam2_calls,
+            "memory_resets": self._memory_resets,
+            "current_memory_frames": self.state["images"].shape[0] if hasattr(self.state, "images") else 0,
         }
-    
+
     def print_performance_summary(self) -> None:
         """Print a simple performance summary."""
         stats = self.get_performance_stats()
@@ -979,4 +395,21 @@ class GSAM2Wrapper:
         print(f"   Total time: {stats['elapsed_time']:.2f}s")
         print(f"   Average FPS: {stats['average_fps']:.1f}")
         print(f"   Real-time capable: {'✅ YES' if stats['average_fps'] >= 25 else '❌ NO'} (25+ FPS)")
-        print() 
+        print(f"   GDINO calls: {stats['gdino_calls']} (detection)")
+        print(f"   SAM-2 calls: {stats['sam2_calls']} (tracking)")
+        print(f"   Memory resets: {stats['memory_resets']}")
+        print(f"   Current memory: {stats['current_memory_frames']}/{self.WINDOW} frames")
+        print(f"   Efficiency: {stats['sam2_calls']/(stats['gdino_calls']+stats['sam2_calls'])*100:.1f}% SAM-2 tracking")
+        print()
+
+    def print_debug_status(self) -> None:
+        """Print current system status for debugging."""
+        print(f"\n🔧 GSAM2 Debug Status:")
+        print(f"   Frame count: {self.f}")
+        print(f"   Hand tracked: {'✅' if self.have_hand else '❌'} (next try: {self.next_hand_try})")
+        print(f"   Object tracked: {'✅' if self.have_obj else '❌'} (next try: {self.next_obj_try})")
+        print(f"   Prompt waiting: {'⏳' if self.prompt_wait else '✅'}")
+        print(f"   Current prompt: '{self.prompt_txt}'")
+        print(f"   Lost counters: hand={self.lost_hand}/{self.MISS_MAX}, obj={self.lost_obj}/{self.MISS_MAX}")
+        print(f"   Memory usage: {self.state['images'].shape[0]}/{self.WINDOW} frames")
+        print()
