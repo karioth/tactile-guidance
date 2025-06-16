@@ -227,20 +227,20 @@ class GSAM2Wrapper:
         – corresponding mask lost for MISS_MAX frames
     """
 
-    _CONF_PATH    = ROOT / "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    _CONF_PATH    = ROOT / "Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     _CKPT_PATH    = ROOT / "Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth"
-    _SAM2_CFG     = "configs/efficienttam/efficienttam_ti.yaml"
-    _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/efficienttam_ti.pt"
-    # _SAM2_CFG     = "configs/efficienttam/efficienttam_ti_512x512.yaml"
-    # _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/efficienttam_ti_512x512.pt"
+    # _SAM2_CFG     = "configs/efficienttam/efficienttam_ti.yaml"
+    # _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/efficienttam_ti.pt"
+    _SAM2_CFG     = "configs/efficienttam/efficienttam_ti_512x512.yaml"
+    _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/efficienttam_ti_512x512.pt"
     # _SAM2_CFG     = "configs/sam2.1/sam2.1_hiera_t.yaml"
     # _SAM2_WEIGHTS = ROOT / "Grounded-SAM-2/checkpoints/sam2.1_hiera_tiny.pt"
 
     # Tunables
-    WINDOW   = 30   # SAM‑2 memory window (frames)
+    WINDOW   = 100   # SAM‑2 memory window (frames)
     MISS_MAX = 30    # lost‑mask threshold (frames)
     RETRY    = 15    # DINO retry interval after a miss (frames)
-    IMG_SIZE = 1024  # SAM‑2 input resolution
+    IMG_SIZE = 512  # SAM‑2 input resolution
 
     def __init__(self, device: str | torch.device | None = None,
                  box_threshold: float = .35, text_threshold: float = .25,
