@@ -5,19 +5,6 @@ all per‑frame tracking.  Re‑detect only if a mask is missing for
 > MISS_MAX consecutive frames.  Grounding DINO retry interval can be
 changed via RETRY.
 
-Key changes vs. previous draft
-──────────────────────────────
-* Guarantee **exactly one frame write** per real video frame – duplicates
-  were the root‑cause of the invisible hand.
-* `_prime()` now **returns** the frame‑index it wrote, so the caller can
-  skip the normal `_add_frame()` path for that iteration.
-* Object priming now also re‑attaches the **existing hand box** so both
-  masks appear on the same key‑frame (mirrors V1 behaviour).
-* Dynamic storage of the actual `obj_id` values returned by SAM‑2 (no
-  more silent failures if the id mapping changes after a reset).
-* Minor clean‑ups: consolidated id handling, extra debug prints, stricter
-  doc‑strings.
-
 Public API (stable for bracelet controller) ─────────────────────
     >>> gsam = GSAM2Wrapper()
     >>> outputs = gsam.track(frame_bgr)  # (xc, yc, w, h, track_id, class_id, conf, depth)

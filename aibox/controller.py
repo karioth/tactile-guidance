@@ -16,7 +16,6 @@ sys.path.append(str(root) + '/yolov5')
 sys.path.append(str(root) + '/strongsort')
 sys.path.append(str(root) + '/unidepth')
 sys.path.append(str(root) + '/midas')
-sys.path.append(str(root) + '/GroundingDINO')
 sys.path.append(str(root) + '/Grounded-SAM-2')
 sys.path.append(str(root) + '/vision_bridge')
 
@@ -417,50 +416,6 @@ class TaskController(AutoAssign):
             if self.belt_controller:
                 self.belt_controller.stop_vibration()
             return "break"
-
-
-    def convert_and_combine_detections(self, gsam2_objects, yolo_hands_tensor, im, im0, index_add):
-        """
-        Convert and combine GSAM2 object detections with YOLO hand detections
-        into unified Detection format: (xc, yc, w, h, track_id, class_id, conf, depth)
-        
-        Args:
-            gsam2_objects: List of GSAM2 detections (already in Detection format)
-            yolo_hands_tensor: YOLO hand predictions tensor (xyxy format)
-            im: Preprocessed image tensor
-            im0: Original image array
-            index_add: Offset to add to hand class IDs
-            
-        Returns:
-            List of combined detections in unified format
-        """
-        combined = []
-        
-        # Add GSAM2 objects (already in correct format)
-        combined.extend(gsam2_objects)
-        
-        # Add YOLO hands (convert from xyxy to Detection format)
-        if len(yolo_hands_tensor) > 0 and yolo_hands_tensor.numel() > 0:
-            # Scale boxes to original image size - use shape[1:] to get (height, width)
-            hands_xyxy = scale_boxes(im.shape[1:], yolo_hands_tensor[:, :4], im0.shape).round()
-            # Convert to xywh format  
-            hands_xywh = xyxy2xywh(hands_xyxy)
-            
-            for i, hand in enumerate(yolo_hands_tensor):
-                # Create Detection tuple: (xc, yc, w, h, track_id, class_id, conf, depth)
-                detection = np.array([
-                    float(hands_xywh[i][0]),        # xc - center x
-                    float(hands_xywh[i][1]),        # yc - center y  
-                    float(hands_xywh[i][2]),        # w - width
-                    float(hands_xywh[i][3]),        # h - height
-                    -1,                             # track_id (no tracking)
-                    int(hand[5]) + index_add,       # class_id (0,1 -> 80,81)
-                    float(hand[4]),                 # confidence
-                    -1                              # depth (placeholder)
-                ])
-                combined.append(detection)
-        
-        return combined
 
 
     def experiment_loop(self, save_dir, save_img, index_add, vid_path, vid_writer):
