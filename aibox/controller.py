@@ -183,7 +183,17 @@ class TaskController(AutoAssign):
                 raise ImportError("GSAM2Wrapper could not be imported. Make sure vision_bridge/gsam2_wrapper.py exists and its dependencies are installed.")
             self.prompt = kwargs.get('prompt', 'coffee cup')
             self.handedness = kwargs.get('handedness', 'right')
-            self.gsam2 = GSAM2Wrapper(handedness=self.handedness)
+            # Get GSAM2 tunable parameters
+            gsam2_window = kwargs.get('gsam2_window', 30)
+            gsam2_miss_max = kwargs.get('gsam2_miss_max', 30)
+            gsam2_retry = kwargs.get('gsam2_retry', 15)
+            
+            self.gsam2 = GSAM2Wrapper(
+                handedness=self.handedness,
+                window=gsam2_window,
+                miss_max=gsam2_miss_max,
+                retry=gsam2_retry
+            )
             self.gsam2.set_prompt(None, self.prompt)
             # Provide a placeholder label dictionary: use the prompt itself for nicer videos
             self.names_obj = {0: self.prompt}
@@ -792,6 +802,9 @@ class TaskController(AutoAssign):
                         vid_writer[0] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[0].write(im0)
 
+        # Print detailed performance breakdown for GSAM2 backend
+        if self.backend == "gsam2" and hasattr(self, 'gsam2'):
+            self.gsam2.print_detailed_performance()
 
     @smart_inference_mode()
     def run(self):

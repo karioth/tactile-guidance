@@ -78,6 +78,24 @@ if __name__ == '__main__':
         default="right",
         help="Which hand is wearing the bracelet (default: right).",
     )
+    parser.add_argument(
+        "--gsam2-window",
+        type=int,
+        default=30,
+        help="SAM-2 memory window size in frames before reset (default: 30). Lower values = more frequent resets but less memory usage.",
+    )
+    parser.add_argument(
+        "--gsam2-miss-max",
+        type=int,
+        default=30,
+        help="Maximum frames an object can be lost before re-detection (default: 30).",
+    )
+    parser.add_argument(
+        "--gsam2-retry",
+        type=int,
+        default=15,
+        help="Frames to wait before retrying GDINO detection after a miss (default: 15).",
+    )
     
     
     # Parse the arguments
@@ -195,23 +213,18 @@ if __name__ == '__main__':
             bracelet_controller=bracelet_controller,
             metric=metric,
             prompt=args.prompt,
-            handedness=args.handedness)
+            handedness=args.handedness,
+            gsam2_window=args.gsam2_window,
+            gsam2_miss_max=args.gsam2_miss_max,
+            gsam2_retry=args.gsam2_retry)
         
         task_controller.run()
         
-        # Print performance summary for GSAM2 backend
-        if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
-            task_controller.gsam2.print_performance_summary()
+        # Performance report is now handled in controller.py
 
     except KeyboardInterrupt:
-        # Print performance summary even on interruption for GSAM2 backend
-        if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
-            task_controller.gsam2.print_performance_summary()
+        # Handle graceful shutdown
         controller.close_app(belt_controller)
 
-    # Print final performance summary for GSAM2 backend
-    if args.backend == "gsam2" and hasattr(task_controller, 'gsam2') and task_controller.gsam2 is not None:
-        task_controller.gsam2.print_performance_summary()
-        
     # In the end, close all processes
     controller.close_app(belt_controller)
