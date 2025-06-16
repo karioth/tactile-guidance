@@ -1,6 +1,0 @@
-[submodule "aibox/Grounded-SAM-2"]
-	path = aibox/Grounded-SAM-2
-	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
-[submodule "aibox/GroundingDINO"]
-	path = aibox/GroundingDINO
-	url = https://github.com/IDEA-Research/GroundingDINO.git
