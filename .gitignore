@@ -155,3 +155,10 @@ aibox/experiment/forms
 aibox/results/
 aibox/vision_bridge/*.mp4
 aibox/test_gsam2_performance.py
+
+# Grounded-SAM-2 large files
+aibox/Grounded-SAM-2/checkpoints/*.pt
+aibox/Grounded-SAM-2/checkpoints/*.pt.*
+aibox/Grounded-SAM-2/gdino_checkpoints/
+aibox/Grounded-SAM-2/outputs/
+aibox/Grounded-SAM-2/.cache/
